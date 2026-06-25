@@ -9,11 +9,6 @@ Cada aplicação é um executável independente, agendado pelo **Windows Task Sc
     - **Todo o código em português.** Identificadores, comentários e strings estão em **português do Brasil**. Nomes reais de classe seguem esse padrão, como `ExecutorQuarentena` em `src/SincronizadorAd/Executores/`.
     - **Execução agendada, sem servidor web.** Cada app roda como processo console disparado pelo **Windows Task Scheduler**. Não há IIS, Kestrel nem endpoint HTTP exposto pela suíte.
 
-!!! warning "Fonte de verdade: o código C# em `src/`"
-    A **única fonte de verdade** desta documentação é o código C# em `src/` do repositório `sincronizadoresgab`. Os arquivos `CLAUDE.md` e o conteúdo de `docs/` são **insumos** que podem estar desatualizados.
-
-    Quando um documento divergir do código, **vale o código**, e a divergência fica registrada na seção **Referência** deste site.
-
 ## As 4 aplicações
 
 | Aplicação | Projeto | O que faz |
