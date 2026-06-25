@@ -1,161 +1,85 @@
 # Glossario
 
-Glossario dos termos de dominio dos **Sincronizadores GAB**, em ordem alfabetica. Cada definicao e curta e cita, quando relevante, o arquivo ou classe onde o termo aparece no codigo (C# .NET 8.0). Quando um termo for uma configuracao, indica-se seu valor padrao.
+Esta pagina reune os termos recorrentes do dominio de negocio e da implementacao
+dos **Sincronizadores GAB**. Os significados refletem o comportamento real do
+codigo-fonte C# (.NET 8.0); quando um termo cita um atributo do Active Directory,
+uma classe ou um arquivo, o nome utilizado e o nome real encontrado no codigo.
 
 !!! note "Convencao"
-    Os caminhos abaixo sao relativos a `src/` no repositorio `sincronizadoresgab`, salvo indicacao em contrario. A versao do **codigo** prevalece sobre qualquer documento.
+    Todo o codigo (identificadores, comentarios e strings) esta em portugues do
+    Brasil. Atributos do Active Directory (ex.: `accountExpires`,
+    `userAccountControl`) seguem o esquema oficial da Microsoft e por isso
+    aparecem em ingles.
 
----
+## Conceitos do BDesk e do fluxo de requisicoes
 
-## A
+| Termo | Significado |
+|-------|-------------|
+| **BDesk** | Sistema de chamados/requisicoes que atua como fila de trabalho e trilha de auditoria. Os sincronizadores consomem requisicoes abertas no BDesk e, ao concluir cada acao, postam o resultado (sucesso/erro) de volta via API REST (`/v1/requisicoes/...`). |
+| **Requisicao** | Item de trabalho aberto no BDesk e consumido pelos sincronizadores. Cada requisicao carrega os dados de entrada (login, CPF, datas, campos do formulario) que orientam a mutacao a ser aplicada no AD/Azure. |
+| **Desdobramento** | Sub-requisicao automatica derivada de uma requisicao principal. No `ExecutorInsercao`, a criacao de uma conta dispara ate 8 desdobramentos (SAP, Sistemas, Rede, Internet, Email, VPN, Telefonia, Azure) via `POST /v1/requisicoes/desdobrar`. |
+| **Solicitante** | Login que figura como autor da requisicao aberta. E derivado da OU do usuario (ver `%PARTICIPANTE_POR_OU%`); se nao houver mapeamento, usa-se o fallback `Config["BDesk"]["Solicitante"]`. |
+| **%PARTICIPANTE_POR_OU%** | Token de template substituido pelo login do solicitante mapeado por OU (via `mapeamento-participantes.json`). Quando nao ha mapa para a OU, aplica-se o fallback do robo de execucao (login sem o 1o caractere, `Login.Substring(1)`). |
+| **FILA / ENVIADOS** | Pastas de uma fila persistente em disco que implementam um *two-phase commit* das requisicoes BDesk: o JSON e gravado em `FILA/`, processado (abertura + acoes) e movido para `ENVIADOS/` apos sucesso, evitando perda em falhas transitorias. |
+| **FILA-MODO-CONSULTA** | Pasta de fila usada quando `Config["BDesk"]["Executar"]` nao e `"true"`. As requisicoes sao geradas para inspecao, mas **nunca submetidas** ao BDesk (modo *dry-run*). |
+| **ItemHistorico.Insucesso / Aguardando** | Flags de controle por requisicao. `Insucesso = true` marca falha definitiva (posta erro no BDesk); `Aguardando = true` adia o processamento sem postar falha (ex.: data de exclusao ainda nao atingida, ou usuario Azure ainda nao propagado dentro do `TempoEsperaEmHoras`). |
 
-### accountExpires
-Atributo do Active Directory (formato **FILETIME**) usado pelo **SincronizadorFerias** para controlar a validade da conta durante o periodo de ferias. Quando o usuario esta de ferias (`FinalFerias > hoje`), recebe a data de inicio das ferias convertida via `ToFileTime()`. Quando o usuario retorna (`FinalFerias <= hoje`), recebe o valor literal `"0"`, que no AD significa **never expires** (conta sem expiracao). Implementado em `SincronizadorFerias/ExecutorSincronizadorFerias.cs` (linhas 246-248, 484-489).
+## Roteamento e modos de execucao
 
-### ADODB
-Biblioteca COM (interop) usada para consultar o Active Directory **em massa**. E empregada na **main pass** do SincronizadorSAP e no SincronizadorFerias, configurando a conexao com `Page Size = 10000` e `Timeout = 30` segundos (`SincronizadorSAP/ServicoSincronizadorSAP.cs`, linhas 886-887, metodo `ObterUsuariosAD2()`). Requer `EmbedInteropTypes=true` e so resolve em build Windows (gera erro MSB4803 em Linux/WSL).
+| Termo | Significado |
+|-------|-------------|
+| **Acao (`-acao`)** | Parametro de linha de comando que roteia o comportamento do executavel. No SincronizadorAD seleciona uma das 10 acoes (`inserir`, `atualizar`, `manutencao`, `quarentena`, `retornar_quarentena`, `excluir`, `excluir_cpf`, `marcar_pendente`, `marcar_pendente_cpf`, `azure`). No SincronizadorSAP seleciona a passada principal ou as acoes de quarentena (`monitorar_quarentena`, `expirar_quarentena`). |
+| **Passada principal** | Modo de *merge* completo do SincronizadorSAP: compara dados de SAP + Metadados + AD e produz lotes de Novos / Alterados / Excluidos. Contrasta com as acoes de quarentena, que apenas monitoram/expiram. O fluxo ativo usa `Comparar_ViaRegraNova`. |
+| **ModoConsultar (`-consultar` vs `-executar`)** | `-consultar` e o modo *dry-run* (apenas simula e registra); `-executar` aplica de fato as mutacoes no AD e submete as requisicoes. |
+| **Regra Nova vs Regra Antiga** | Criterio de exclusao no SincronizadorSAP. **Regra Nova** (`UsuariosExcluidos_ViaRegraNova`, ativa): marca um CPF para exclusao apenas quando **100%** dos registros daquele CPF (agregando SAP + Metadados) estao desligados. **Regra Antiga** (`UsuariosExcluidos`, compilada mas nao invocada): marcava exclusao se **qualquer** registro estivesse desligado. |
 
-### ADS_UF_ACCOUNTDISABLE
-Flag `0x0002` do atributo `userAccountControl` que **desabilita** a conta no AD. Definida em `ActiveDirectory.cs:9` com o comentario "Disable user account". Aplicada via OR bit a bit na entrada em quarentena (`ExecutorQuarentena.cs`, linhas 204-207) e removida (re-habilitacao) na reativacao por recontratacao em `ExecutorAuxiliarBase.cs`. A exclusao por login so prossegue se a conta tiver esta flag ligada (conta inativa).
+## Active Directory: atributos e flags
 
-### ANTE
-Participante **solicitante** de uma requisicao BDesk, derivado da **ultima OU** do `distinguishedName` (DN) do usuario. O algoritmo faz split do DN por virgula, descarta as partes `DC=`, toma o valor da ultima parte restante e busca em `LoginsDoSolicitantePorOu`, com fallback para `Config["BDesk"]["Solicitante"]` (`SincronizadorSAP/ServicoSincronizadorSAP.cs`, metodo `MapearSolicitante`, linhas 326-362). Se o BDesk responder exatamente `Participante 'ANTE' nao encontrado`, o envio tenta um `LoginSolicitante` alternativo (`AlternativaEnvioBDesk`).
+| Termo | Significado |
+|-------|-------------|
+| **`accountExpires`** | Atributo AD no formato FILETIME que controla a expiracao da conta. Os valores `0` e `MaxValue` (`9223372036854775807`) significam *never expires*. O SincronizadorFerias usa este atributo para desabilitar/liberar contas durante e apos as ferias. |
+| **`userAccountControl`** | Bitmask de controle da conta no AD. Os sincronizadores leem e gravam este valor para habilitar/desabilitar contas via operacoes *bitwise*. |
+| **`ADS_UF_ACCOUNTDISABLE`** | Bit `0x0002` do `userAccountControl` que desabilita a conta (constante definida em `src/Sincronizadores.Lib/ActiveDirectory.cs`). Aplicado com OR (`uac \| ADS_UF_ACCOUNTDISABLE`) para desabilitar e removido com AND/NOT (`uac & ~ADS_UF_ACCOUNTDISABLE`) para reativar. |
+| **`extensionAttribute` / `msDS-cloudExtensionAttribute1`** | Atributo onde a OU original do usuario e salva durante a quarentena, **antes** do `MoveTo` (pois o DN muda apos a movimentacao). O atributo padrao e `msDS-cloudExtensionAttribute1` (configuravel via `config.json`). O `ExecutorRetornarQuarentena` le este valor para devolver o usuario a OU de origem. |
+| **campo `info`** | Atributo AD onde o `ExecutorQuarentena` grava o carimbo de tempo de entrada em quarentena, no formato `Movido para quarentena em yyyy-MM-dd HH:mm:ss`. E parseado pelas acoes SAP (`ParseTimestampQuarentena`) para comparar com o ultimo login. |
+| **`lastLogonTimestamp`** | Atributo AD do ultimo login **bem-sucedido**. Usado para detectar inatividade (quarentena no SAP) e logins pos-quarentena. Tentativas de login falhas nao o atualizam, portanto a filtragem por este atributo considera apenas logins com sucesso. |
+| **`whenCreated`** | Atributo AD usado como *fallback* de inatividade quando `lastLogonTimestamp` e nulo/invalido (metodo `SemLogarHaTempos` do SincronizadorSAP). |
+| **Watermark `:CheckedOut:`** | Marca de propriedade da automacao gravada no segundo paragrafo do `streetAddress` pelo SincronizadorFerias (bloco `:CheckedOut:NAO REMOVER ESTE BLOCO!}`). Sinaliza que o valor foi definido pela automacao, evitando sobrescrever ajustes manuais; e removido no retorno das ferias. |
 
-## B
+## Quarentena
 
-### BDesk
-Sistema de chamados (REST API) consumido e alimentado por **todos** os sincronizadores. As requisicoes sao abertas via `POST /v1/requisicoes/abrir` e fechadas com acoes via `POST /v1/requisicoes/{id}/acoes`; requisicoes abertas sao consultadas em `/v1/requisicoes/abertas` (deduplicacao). E a fonte de requisicoes processadas pelo SincronizadorAD e o destino das colacoes de Novos/Alterados/Excluidos da main pass do SAP.
+| Termo | Significado |
+|-------|-------------|
+| **OU mensal `5S-{MM-yyyy}`** | Sub-OU criada (se nao existir) dentro da OU de quarentena, nomeada com o mes corrente (ex.: `5S-03-2026`). O usuario em quarentena e movido para esta OU mensal via `MoveTo`. |
 
-## C
+!!! tip "Sequencia da quarentena"
+    No `ExecutorQuarentena`, a ordem e: (1) salvar a OU original no
+    `extensionAttribute`; (2) mover o usuario para a OU mensal `5S-{MM-yyyy}`;
+    (3) gravar o timestamp no campo `info`; (4) desabilitar a conta com
+    `ADS_UF_ACCOUNTDISABLE`. O retorno (`ExecutorRetornarQuarentena`) **nunca**
+    altera o `userAccountControl`: a conta permanece desabilitada apos voltar a
+    OU original.
 
-### CheckedOut / watermark
-Marcador `:CheckedOut:` gravado pelo **SincronizadorFerias** no campo `streetAddress` para indicar que a automacao e **proprietaria** da alteracao. O bloco completo tem o formato:
+## Identificacao, normalizacao e listas
 
-```text
-{Ferias: DD/MM/YYYY - DD/MM/YYYY
-SincronizadorFerias {version}:CheckedOut:NAO REMOVER ESTE BLOCO!}
-{conteudo original}
-```
+| Termo | Significado |
+|-------|-------------|
+| **`CPF.SomenteDigitos()`** | Normalizacao do CPF removendo formatacao (pontos/traco), usada como chave de agrupamento (`GroupBy`) e de junção (`join`) entre as fontes SAP, Metadados e AD. O CPF literal e preservado nos campos de saida das requisicoes. |
+| **Prefixo `ps.`** | Indica prestador de servico. No SincronizadorAD, e prependado a cada tentativa de login quando o formulario marca "Prestador de Servico?" = True; prestadores tambem tem *cap* de 90 dias em `accountExpires` e nao entram no `GrupoVPN`. No SincronizadorSAP, logins iniciados por `ps.` sao removidos antes da comparacao (`RemoverComPS`). |
+| **Listas negras / listas de excecao** | Logins e grupos ignorados pela sincronizacao. Existem conjuntos distintos: AD (`lista-negra-ad-*`), quarentena (`lista-negra-quarentena-*`) e ferias (`lista-negra-ferias-*`). Grupos sao normalizados para `CN=...,DC=...` em minusculas. Usuarios nessas listas sao pulados pelas automacoes correspondentes. |
+| **usuarios-permitidos / usuarios-proibidos** | *Whitelist* / *blacklist* por CPF no SincronizadorSAP (`usuarios-permitidos.txt`, `usuarios-proibidos.txt`). A whitelist so e aplicada quando `[BDesk] ExecutarSomenteUsuariosDaListaDeUsuariosPermitidos = true`. |
 
-O `{version}` vem de `Versao.Release`. O sentinela de remocao e `:CheckedOut:NAO REMOVER ESTE BLOCO!}\n`. O campo e truncado em **1020 caracteres** (limite UTF-16 do AD). A presenca do marcador na linha de indice 1 do split por `\n` identifica os usuarios de retorno/atualizacao (regra **L2**). Ver `ExecutorSincronizadorFerias.cs` (linhas 262-293).
+## Tecnologias e padroes de implementacao
 
-!!! warning "Remocao manual do watermark"
-    Apagar manualmente o bloco watermark do `streetAddress` deixa a conta presa no fluxo de ferias. Nao remova o bloco a mao.
+| Termo | Significado |
+|-------|-------------|
+| **XOR (criptografia de credenciais)** | Esquema de cifragem de credenciais no `conf.ini` usando chaves fixas em `Cross-Cutting/Security/Cryptography.cs`: `EncC1 = 109`, `EncC2 = 191`, `EncKey = 161`. Valores cifrados sao gerados via `-criptografar`. |
+| **ADODB / ADSDSOObject** | Acesso COM ao Active Directory (provedor `ADSDSOObject`). Usado pelo SincronizadorSAP e SincronizadorFerias para consultas LDAP via `ADODB.Connection`. A `COMReference ADODB` (EmbedInteropTypes) exige build em Windows com Visual Studio. |
+| **`DirectorySearcher`** | Classe de `System.DirectoryServices` para busca LDAP. As acoes de quarentena do SAP usam `SearchScope.Subtree` com `PageSize = 1000`; o SincronizadorGrupos usa `SearchScope.OneLevel` (apenas usuarios diretos de cada OU). |
+| **Microsoft Graph / MSAL** | Bibliotecas usadas pela acao `azure` do SincronizadorAD para MFA no Azure AD (`Microsoft.Graph` + `Microsoft.Identity.Client`). A identidade vem direto dos campos BDesk (`UserPrincipalName` em "DADOS DO USUARIO AZURE"), sem busca no AD. |
+| **Self pattern** | Uso de `Self.Metodo()` em vez de chamada direta para permitir interceptacao em testes (RhinoMocks). Ex.: a passada principal do SAP chama `Self.Comparar_ViaRegraNova`. |
 
-### CPF.SomenteDigitos()
-Metodo de extensao que normaliza o CPF removendo tudo que nao for digito. E a **chave de correlacao** entre todas as fontes (SAP, Metadados, AD): agrupamentos, joins e deduplicacoes usam essa chave. Aparece, por exemplo, no agrupamento de exclusao do SAP (`ExecutorSincronizadorSAP.cs:322`) e nos joins do SincronizadorFerias.
-
-## D
-
-### DA13 / DA16 / DA19
-Codigos de campo do dicionario de dados SAP:
-
-| Codigo | Significado | Atributo AD | Usado em alteracao? |
-|--------|-------------|-------------|---------------------|
-| **DA13** | Data de Nascimento | — | Nao (sincronizada, mas `Comparar=false`) |
-| **DA16** | Cargo | `title` | Sim (case-insensitive) |
-| **DA19** | Centro de Custo | `postalCode` | Sim (case-insensitive) |
-
-Apenas **DA16** e **DA19** disparam deteccao de alteracao no SAP; a comparacao e case-insensitive via `.ToLower()` (`SincronizadorSAP/ServicoSincronizadorSAP.cs`, metodo `Diferentes()`, linhas 103-119 e 721-734).
-
-### Desdobramento
-Sub-requisicao criada via `POST /v1/requisicoes/desdobrar` para provisionar acessos durante a **insercao** de um usuario. O SincronizadorAD suporta ate **8** tipos de desdobramento (SAP, Sistemas, Rede, Internet, Email, VPN, Telefonia, Azure), mas dispara cada um **condicionalmente**, apenas quando ha solicitacao explicita no formulario BDesk (ex.: SAP so e disparado se "Acesso Sistemas > 2.1 - SAP" = `True`). Ver `ExecutorInsercao.cs`.
-
-### DeveProcessar
-Flag de elegibilidade de empresa/origem. No SAP/Ferias e lido da coluna 2 de `empresas.txt` (`== "true"`); no Metadados vem de `Config["Metadados"]["DeveProcessar"]` (`== "true"`). Usuarios com `DeveProcessar=false` sao filtrados antes da comparacao (`SincronizadorFerias/ExecutorSincronizadorFerias.cs`, linhas 563-565 e 683).
-
-### DiasInatividade
-Limiar (em dias) de inatividade sem login para um usuario virar **candidato a quarentena** por inatividade. Valor de exemplo **90**. Lido de `ConfigJson["ActiveDirectory"]["Quarentena"]["DiasInatividade"]` na main pass do SAP (`ExecutorSincronizadorSAP.cs:1221`), comparando `lastLogonTimestamp` (com fallback para `whenCreated`).
-
-### DiasParaExpiracao
-Limiar (em dias) de permanencia em quarentena, sem login posterior, para disparar a **exclusao definitiva**. Padrao **30** (`AcaoSincronizadorSAP.cs:135`, metodo `ObterDiasParaExpiracao()`), configuravel em `config.json [ActiveDirectory][Quarentena][DiasParaExpiracao]`. Consumido por `AcaoExpirarQuarentena.cs`.
-
-## E
-
-### ENVIADOS
-Diretorio (write-ahead) para onde as requisicoes BDesk **confirmadas** sao movidas apos o envio bem-sucedido. Faz parte do trio `FILA` / `FILA-MODO-CONSULTA` / `ENVIADOS`, criado em runtime relativo ao executavel.
-
-### ExtensionAttributeOuOriginal
-Atributo do AD usado para guardar a **OU original** do usuario enquanto ele esta em quarentena. Padrao `msDS-cloudExtensionAttribute1` (`ExecutorSincronizadorAd.cs:37`), configuravel via `config.json [ActiveDirectory][Quarentena][ExtensionAttributeOuOriginal]`. Gravado **antes** do move em `ExecutorQuarentena.cs:183` e lido no retorno em `ExecutorRetornarQuarentena.cs:28`.
-
-## F
-
-### FILA / FILA-MODO-CONSULTA / ENVIADOS
-Diretorios **write-ahead** das requisicoes BDesk, criados em runtime:
-
-- **`FILA/`** — requisicoes pendentes a serem submetidas (modo `-executar`).
-- **`FILA-MODO-CONSULTA/`** — requisicoes geradas em modo `-consultar` (dry-run); **nunca** sao submetidas.
-- **`ENVIADOS/`** — requisicoes ja confirmadas pela API.
-
-No SincronizadorGrupos, a pasta usada e `FILA` quando `[BDesk]Executar == "true"` e `FILA-MODO-CONSULTA` caso contrario (`ExecutorSincronizadorGrupos.cs`, linhas 209-223).
-
-### FILETIME
-Formato de data de 64 bits do Windows/AD (intervalos de 100 ns desde 1601). Usado em `accountExpires` (Ferias) e em `lastLogonTimestamp`, este ultimo decodificado a partir de `HighPart`/`LowPart` via reflexao em `ConverterCOMParaFileTime()` (`SincronizadorSAP/ExecutorSincronizadorSAP.cs`, linhas 1333-1354).
-
-### funcionalidades.txt
-Arquivo de **feature flags** (mais de 20 flags) localizado em `%BUSINESS_DESK%`, carregado por `GerenciadorVersao.cs:14` (`BooleanosVersao`) via `Path.Combine(%BUSINESS_DESK%, "funcionalidades.txt")`.
-
-## H
-
-### Homologacao
-Configuracao de build do solution, **alias de Release** (mesmas opcoes de compilacao). As configuracoes disponiveis sao `Debug`, `Release` e `Homologacao` (`dotnet build src/Sincronizadores.sln -c Homologacao`).
-
-## L
-
-### lastLogonTimestamp
-Atributo AD (FILETIME) consultado para medir inatividade. Na deteccao de candidatos a quarentena, se for nulo ou `<= 0`, ha **fallback** para `whenCreated` (`ExecutorSincronizadorSAP.cs`, linhas 1288-1292). Tambem e a base para detectar login "pos-quarentena" nas acoes `monitorar_quarentena` e `expirar_quarentena`.
-
-### LocalData
-Diretorio de **deduplicacao** do SincronizadorSAP, com arquivos diarios no formato `yyyyMMdd.json`. Antes da montagem dos JSONs de exclusao (`ExecutorSincronizadorSAP.cs:264`), remove os logins cuja exclusao foi bem-sucedida (API retornou ID valido) nos ultimos **7 dias** (configuravel via `DiasDeEsperaPorExclusoes`), evitando retentativas acidentais. Em modo dry-run usa `LocalData-modo-consultar/`.
-
-## M
-
-### main pass
-A passada **principal** do SincronizadorSAP, agendada para **03:00**. Faz o merge das tres origens (SAP SOAP + Metadados HTTP + AD via ADODB) e produz colacoes de Novos/Alterados/Excluidos para abertura de requisicoes BDesk. Confirmado em `SincronizadorSAP/CLAUDE.md:303` e `instrucoes.txt:4`.
-
-### Metadados
-Sistema de RH interno usado como fonte de dados. Possui duas faces: **HTTP/XML** (consumida por SAP, Ferias e pela verificacao de recontratacao do AD) e **SQL/OleDb** (usada pelo SincronizadorFerias via `[BancoDeDadosMetadados]` para injetar datas de ferias). A correlacao com as demais fontes e feita por `CPF.SomenteDigitos()`.
-
-### modo -consultar
-Modo de execucao **dry-run, read-only**: nao aplica `CommitChanges` no AD, nao faz `POST` no BDesk e escreve em `FILA-MODO-CONSULTA/` / `LocalData-modo-consultar/`. Disponivel em todos os apps.
-
-!!! warning "Excecao no SincronizadorGrupos"
-    O rename de CN (quando ha `NomeEmpresa`) e executado **mesmo em modo `-consultar`**, sem a guarda `if(!ModoConsultar)` que protege os demais campos (`ExecutorSincronizadorGrupos.cs:548-550`). E um comportamento divergente (bug conhecido), registrado nas discrepancias.
-
-## O
-
-### OU mensal 5S-{MM-yyyy}
-Pasta (Organizational Unit) de **quarentena criada mensalmente** sob a OU de quarentena configurada. O nome segue `5S-{MM-yyyy}` (ex.: `5S-06-2026`) e, se nao existir, e criada com a descricao `OU de quarentena para 5S-{MM-yyyy}`. Ver `ExecutorQuarentena.cs` (linhas 59-111). O usuario em quarentena e movido para dentro dela.
-
-## P
-
-### ps. (prefixo de login)
-Prefixo aplicado automaticamente ao login de um **Prestador de Servico**. Quando o campo "1.11 Prestador de Servico?" e `True`, define-se `prefixo = "ps."`, concatenado em todas as 8 tentativas de geracao de login (`ExecutorInsercao.cs`, linhas 122-188). Na validacao de palavras pejorativas, o prefixo e removido via `Split('.').Last()` antes da comparacao.
-
-### Prestador de Servico
-Conta cuja validade e **limitada a 90 dias** a partir da data de abertura da requisicao. Se a data de expiracao solicitada exceder esse limite, prevalece o cap de 90 dias (`dataAbertura.AddDays(90)`, `ExecutorInsercao.cs`, linhas 413-418). Seu login recebe o prefixo `ps.`.
-
-## Q
-
-### Quarentena
-Estado **temporario** de uma conta desligada no AD. Na entrada (`ExecutorQuarentena.cs`), o sistema: (1) salva a OU original em `ExtensionAttributeOuOriginal` **antes** do move; (2) move o usuario para a **OU mensal `5S-{MM-yyyy}`**; (3) grava o timestamp `Movido para quarentena em yyyy-MM-dd HH:mm:ss` no campo `info`; (4) desabilita a conta (`userAccountControl |= ADS_UF_ACCOUNTDISABLE`). O retorno (`ExecutorRetornarQuarentena.cs`) move de volta e limpa `info`/extensionAttribute, mas **nao** re-habilita a conta. O ciclo e cross-project (SAP abre requisicoes, AD executa).
-
-## R
-
-### Recontratacao
-Verificacao por **CPF** consultando primeiro **Metadados** (HTTP) e depois **SAP** (SOAP) para checar se um usuario marcado para exclusao foi recontratado. Se recontratado, a conta e reativada (remove `ADS_UF_ACCOUNTDISABLE`) e a exclusao e **bloqueada** (`ExecutorExclusao.cs`, `VerificarRecontratacao()`, linhas 290-320). Aplica-se apenas a **exclusao por login**: e desabilitada para `ExecutorExclusaoPorCPF` e pulada quando o usuario ja esta em quarentena.
-
-## S
-
-### SAP
-Fonte de dados de RH via **SOAP/XML**. Fornece os usuarios da main pass (mesclados com Metadados e AD) e e a segunda fonte consultada na verificacao de **recontratacao** do SincronizadorAD.
-
-## U
-
-### userAccountControl
-Atributo do AD que controla o estado da conta (entre outras flags). Manipulado via OR/AND bit a bit com `ADS_UF_ACCOUNTDISABLE` (`0x0002`) para desabilitar (quarentena) ou reabilitar (recontratacao). O retorno de quarentena **nao** modifica este atributo. Confirmado em `ExecutorSincronizador.cs:47` (`CampoAccountControl = "userAccountControl"`).
-
-## X
-
-### XOR
-Algoritmo de criptografia das credenciais armazenadas no `conf.ini` ([SAP], [Metadados], [ActiveDirectory], [BDesk]). Usa **chaves fixas** definidas em `Cryptography.cs` (linhas 10-12): `EncKey=161`, `EncC1=109`, `EncC2=191`. A geracao/cifragem e feita pelo utilitario de linha de comando `<exe> -criptografar <valor>`.
+!!! warning "O codigo e a verdade"
+    Os significados acima refletem o comportamento verificado no codigo-fonte em
+    `src/`. Documentos de negocio e arquivos `CLAUDE.md` sao insumos e podem estar
+    desatualizados; em caso de divergencia, prevalece o codigo.

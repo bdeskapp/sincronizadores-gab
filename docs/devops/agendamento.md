@@ -1,88 +1,93 @@
-# Agendamento e Operacao
+# Agendamento e Operação
 
-Esta pagina documenta o **agendamento operacional** da suite Sincronizadores GAB, executada via **Windows Task Scheduler** nos servidores GAB13013i (ativo) e GAB13011i (standby), a partir de `F:\BusinessDesk\ASK\`.
+Esta página descreve **como** os Sincronizadores GAB são disparados em produção e **quando** cada executável roda ao longo do dia. A lógica de negócio de cada ação está documentada em [Ciclo de Vida da Quarentena](../negocio/ciclo-vida-quarentena.md); aqui o foco é a orquestração temporal e a operação.
 
-A suite nao possui orquestrador interno: cada execucao e uma chamada independente de um executavel console (`SincronizadorSAP.exe`, `SincronizadorAD.exe`, etc.), agendada externamente. A ordem e os horarios formam um **fluxo cross-projeto** que precisa ser respeitado pelo agendador para que o ciclo de quarentena funcione corretamente.
+!!! info "Onde vivem os horários"
+    **Não há agendamento fixo em código.** Nenhum dos quatro executáveis (`SincronizadorAD.exe`, `SincronizadorSAP.exe`, `SincronizadorFerias.exe`, `SincronizadorGrupos.exe`) contém um relógio interno ou cron embutido. Todos os horários vivem na configuração do **Windows Task Scheduler** do servidor, que **não é versionada** neste repositório. Os executáveis apenas recebem `-executar`/`-consultar` e, quando aplicável, `-acao <nome>` na linha de comando; a decisão de "quando rodar" é externa.
 
-!!! warning "Distincao entre CONFIRMADO e A CONFIRMAR"
-    Apenas o horario das **03:00** (main pass do `SincronizadorSAP`) esta confirmado em documentacao operacional (`instrucoes-configuracao/instrucoes.txt:4`). Os horarios do ciclo de quarentena (06:00 / 06:15 / 06:30 / 07:00) vem de `agendamento-operacao.md` secao 2.2 e **ainda precisam ser conferidos contra a producao real**. Os parametros temporais (intervalos, dias, defaults) marcados como CONFIRMADO foram validados diretamente no codigo-fonte e estao com as referencias de arquivo/linha.
+## Ciclo diário confirmado em produção
 
----
+O ciclo abaixo foi confirmado no servidor **GAB13013i** (servidor ativo), com referência de execução em **08/02/2026**. Ele encadeia a passada principal do SAP de madrugada com a automação de quarentena entre 06:00 e 07:00, atravessando dois executáveis (`SincronizadorSAP.exe` abre requisições no BDesk; `SincronizadorAD.exe` as processa contra o Active Directory).
 
-## Tabela de tarefas agendadas
+| Horário | Comando | O que faz |
+|---|---|---|
+| **03:00** | `SincronizadorSAP.exe` | **Passada principal.** Merge de SAP + Metadados + AD. Produz lotes de Novos / Alterados / Excluídos e abre requisições BDesk de inserção, atualização e exclusão. |
+| **06:00** | `SincronizadorSAP.exe -acao monitorar_quarentena` | Varredura LDAP _subtree_ da OU de quarentena (`PageSize` 1000). Detecta `lastLogonTimestamp` posterior ao timestamp de entrada em quarentena → abre **requisição de retorno** no BDesk. |
+| **06:15** | `SincronizadorSAP.exe -acao expirar_quarentena` | Varredura LDAP _subtree_. Detecta usuários com **30+ dias** em quarentena **sem login posterior** → abre **requisição de exclusão** no BDesk. |
+| **06:30** | `SincronizadorAD.exe -executar -acao retornar_quarentena` | Processa as requisições de retorno abertas. Lê o `extensionAttribute` (`msDS-cloudExtensionAttribute1`), executa `MoveTo(ouOriginal)` e limpa os metadados. Aplica intervalo mínimo de **12 h** entre reprocessamentos **quando o `extensionAttribute` está vazio**. |
+| **07:00** | `SincronizadorAD.exe -executar -acao excluir` | Processa as requisições de exclusão abertas. Verifica recontratação em SAP/Metadados e, se confirmada a exclusão, envia a conta para a Lixeira do AD. |
 
-| Horario | Tarefa | Comando | Acao no fluxo | Status |
-|---------|--------|---------|---------------|--------|
-| **03:00** | Main pass SAP | `SincronizadorSAP.exe` | Merge SAP + Metadados + AD; abre Novos/Alterados/Excluidos e candidatos a quarentena no BDesk | **CONFIRMADO** (`src/SincronizadorSAP/CLAUDE.md:303`; `instrucoes-configuracao/instrucoes.txt:4`) |
-| **06:00** | Monitorar quarentena | `SincronizadorSAP.exe -acao monitorar_quarentena` | Detecta login pos-quarentena (`lastLogonTimestamp > timestamp`) e abre `retornar-quarentena.json` | A CONFIRMAR (horario) |
-| **06:15** | Expirar quarentena | `SincronizadorSAP.exe -acao expirar_quarentena` | Detecta inatividade >= `DiasParaExpiracao` (30) sem login posterior e abre `excluir-definitivo.json` | A CONFIRMAR (horario) |
-| **06:30** | Retornar quarentena | `SincronizadorAD.exe -executar -acao retornar_quarentena` | Move usuario de volta da OU mensal para a OU original | A CONFIRMAR (horario) |
-| **07:00** | Excluir | `SincronizadorAD.exe -executar -acao excluir` | Deleta contas expiradas (com verificacao de recontratacao) | A CONFIRMAR (horario) |
+!!! note "A ordem é garantida apenas pelo espaçamento no Task Scheduler"
+    A garantia de que o **monitoramento** (06:00) executa **antes** da **expiração** (06:15) é fornecida **exclusivamente pelo espaçamento de 15 minutos no Windows Task Scheduler** — não existe qualquer mecanismo de sincronização, _lock_, fila de barreira ou dependência declarada em código entre `AcaoMonitorarQuarentena` e `AcaoExpirarQuarentena`. Em `ExecutorSincronizadorSAP.Executar()` cada ação é roteada para uma execução independente do processo. Se os horários do Task Scheduler forem alterados de forma que a expiração rode antes ou simultaneamente ao monitoramento, um usuário que logou após a quarentena poderia, em tese, ser expirado antes de o retorno ser detectado. Mantenha o espaçamento ao reagendar.
 
-!!! note "Ordem obrigatoria do ciclo de quarentena"
-    `monitorar_quarentena` (06:00) deve rodar **antes** de `expirar_quarentena` (06:15) para capturar usuarios que logaram "de ultima hora". A implementacao assume essa sequencia: `AcaoExpirarQuarentena` ignora usuarios cujo `lastLogonTimestamp` e posterior ao timestamp de quarentena, presumindo que o monitoramento ja atuou. A ordem **nao e forcada internamente** — depende exclusivamente do agendador externo. Veja o detalhamento em [Ciclo de Vida da Quarentena](../negocio/ciclo-vida-quarentena.md).
+!!! warning "Agendamento de Férias e Grupos não confirmado"
+    O agendamento de **`SincronizadorFerias.exe`** e **`SincronizadorGrupos.exe`** **não está documentado em código** e não aparece no ciclo confirmado acima. Os horários devem ser confirmados diretamente com a operação / configuração do Task Scheduler nos servidores. Não assuma horários para esses dois executáveis.
 
----
+## Limiares e seus defaults
 
-## Parametros temporais confirmados em codigo
+Os limiares abaixo controlam quando cada ação atua. A coluna "Origem do default" indica se o valor padrão vem do **código** (assumido quando a chave está ausente) ou se é **obrigatório no `config.json`/`conf.ini`** (sem fallback — a ausência quebra a execução).
 
-Os seguintes parametros foram verificados diretamente no codigo-fonte e governam o comportamento temporal do ciclo:
+| Limiar | Valor de referência | Origem do default | Onde |
+|---|---|---|---|
+| `DiasInatividade` | **90** | **Obrigatório em `config.json`** — sem default no código (lido via `ToObject<int>()` sem fallback). | Passada principal — `ExecutorSincronizadorSAP.cs:1221` |
+| `DiasParaExpiracao` | **30** | **Default em código** (`?? 30`). Configurável em `config.json`. | `AcaoSincronizadorSAP.cs:135` |
+| `MaximoAbertura` | **2** (exemplo) | **Obrigatório em `config.json`** (`ActiveDirectory.Quarentena.MaximoAbertura`). Limita aberturas de quarentena por execução via `.Take()`. | `ExecutorSincronizadorSAP.cs` (`ProcessarUsuariosParaQuarentena`) |
+| `DiasDeEsperaPorExclusoes` | **7** | **Default em código** (`?.OuDefault("7")`). Sobrescrito para **14** nos `EXEMPLOS/SECRETOS`. Controla a janela de deduplicação de exclusões em `LocalData/yyyyMMdd.json`. | seção `[BDesk]` do `conf.ini` |
+| `QuantidadeMaximaDeInsercoes` / `Atualizacoes` / `Exclusoes` | **0** | **Sem limite** quando `0`. Overridável na seção `[BDesk]` do `conf.ini`. | Lotes de Novos / Alterados / Excluídos |
+| `MaximoAlteracoesPorExecucao` | — | **Sem default no código** (lido da config sem fallback visível). | `SincronizadorGrupos`, seção `[Geral]` |
 
-| Parametro | Valor | Origem | Observacao |
-|-----------|-------|--------|------------|
-| Intervalo minimo de retorno de quarentena | **12 horas** | `ExecutorRetornarQuarentena.cs:15` (`TimeSpan.FromHours(12)`) | Quando `ExtensionAttributeOuOriginal` esta vazio, aguarda 12h antes de marcar insucesso (evita corrida com `ExecutorQuarentena`) |
-| Dias padrao de exclusao por inatividade (SAP) | **7 dias** | `ExecutorSincronizadorSAP.cs:541` (default code) | Janela de deduplicacao de exclusoes; exemplo `SECRETOS` sobrescreve para **14** via `DiasDeEsperaPorExclusoes` |
-| `DiasParaExpiracao` | **30 dias** | `AcaoSincronizadorSAP.cs:135` (default code) | Configuravel via `config.json` `[ActiveDirectory][Quarentena][DiasParaExpiracao]` |
+!!! tip "Defaults de código vs. obrigatórios"
+    Quando o valor é **default em código**, omitir a chave na configuração é seguro — o sistema assume o padrão. Quando é **obrigatório**, omitir a chave provoca falha de validação (`DiasInatividade`, `MaximoAbertura`) ou comportamento indefinido. Trate `DiasInatividade` e `MaximoAbertura` como campos que devem sempre constar no `config.json`.
 
-!!! tip "Como o codigo le esses valores"
-    `ObterDiasParaExpiracao()` (`AcaoSincronizadorSAP.cs:132-136`) retorna o valor de `config.json[ActiveDirectory][Quarentena][DiasParaExpiracao]` ou, na ausencia, o default `30`. O intervalo de 12 horas e uma constante estatica nao configuravel.
+## Resiliência operacional
 
----
+### Fila `FILA/` para requisições BDesk (two-phase commit)
 
-## Parametros de `config.json` `[ActiveDirectory][Quarentena]`
+As requisições destinadas ao BDesk não são enviadas diretamente: são primeiro gravadas como JSON em `FILA/` e depois processadas por `ProcessarFilaRequisicoesPendentes()`, que faz o **POST de abertura**, **move o arquivo para `ENVIADOS/`** e então executa o POST de encerramento/ação. Esse padrão **two-phase commit** garante que, se o processo morrer no meio do envio, a requisição não fica perdida nem é duplicada — o arquivo permanece em `FILA/` até ser comprovadamente enviado.
 
-A secao de quarentena controla a abertura de requisicoes no main pass e o ciclo de expiracao. Campos sem default sao **obrigatorios** e a ausencia provoca erro de leitura (lidos via `ToObject<int>()` no main pass).
+Em **dry-run** (`-consultar` / `BDesk.Executar != "true"`), as requisições são escritas em **`FILA-MODO-CONSULTA/`** e **nunca submetidas** ao BDesk.
 
-| Parametro | Obrigatorio | Default | Exemplo (`RODAVEIS/config.json`) | Funcao |
-|-----------|-------------|---------|----------------------------------|--------|
-| `OuDestino` | **Sim** | _(nenhum)_ | `OU=Quarentena` | OU raiz de quarentena; sob ela sao criadas as OUs mensais `5S-{MM-yyyy}` |
-| `DiasInatividade` | **Sim** | _(nenhum)_ | `90` | Limiar de inatividade (`lastLogonTimestamp`) para candidatar a quarentena |
-| `MaximoAbertura` | **Sim** | _(nenhum)_ | `2` | Maximo de requisicoes de quarentena abertas por execucao (limita blast radius) |
-| `DiasParaExpiracao` | Nao | `30` | `30` | Dias em quarentena, sem login posterior, ate exclusao definitiva |
-| `ExtensionAttributeOuOriginal` | Nao | `msDS-cloudExtensionAttribute1` | `msDS-cloudExtensionAttribute1` | Atributo AD onde a OU original e salva antes do move (confirmado `ExecutorSincronizadorAd.cs:37`) |
+### Reexecução agendada para retry de falhas transitórias
 
-!!! note
-    `DiasInatividade` e `MaximoAbertura` nao tem default no codigo e sao lidos via `ToObject<int>()` no main pass — um valor ausente provoca falha de leitura da configuracao. O exemplo de producao usa `DiasInatividade=90` e `MaximoAbertura=2`.
+Não há _retry loop_ síncrono dentro de uma única execução para a maioria das falhas. A estratégia de resiliência é a **reexecução agendada**: requisições que não puderam ser concluídas são marcadas como **`Aguardando`** (em vez de `Insucesso`) e simplesmente reprocessadas na próxima passada agendada. Exemplos:
 
----
+- **Retorno de quarentena** com `extensionAttribute` ainda vazio: aguarda **12 h** (`IntervaloMinimoEntreExecucoes = TimeSpan.FromHours(12)`) entre tentativas antes de marcar insucesso definitivo — dando tempo para a propagação do atributo no AD (`ExecutorRetornarQuarentena.cs:37-41`).
+- **Exclusão** cuja "Data da exclusão efetiva" ainda não chegou: marcada `Aguardando` e revisitada na próxima execução (`ExecutorExclusao.cs`, `PodeExcluir()`).
+- **Azure** quando o usuário ainda não apareceu no Microsoft Graph: marcada `Aguardando` enquanto a requisição for mais nova que `TempoEsperaEmHoras`.
 
-## A confirmar contra producao
+### Modos `-executar` vs. `-consultar`
 
-!!! warning "Pendencias de validacao operacional"
-    Os itens abaixo nao puderam ser confirmados a partir do codigo ou da documentacao versionada e dependem de inspecao das tarefas reais no Windows Task Scheduler dos servidores GAB13013i / GAB13011i.
+| Modo | Efeito |
+|---|---|
+| `-executar` | Aplica as mutações reais (AD `CommitChanges`/`MoveTo`, envio de requisições BDesk a partir de `FILA/`). |
+| `-consultar` | _Dry-run_: escreve em `FILA-MODO-CONSULTA/` e não submete requisições. **Ver alerta abaixo sobre `SincronizadorGrupos`.** |
 
-    - **Horarios completos do ciclo de quarentena** — 06:00 / 06:15 / 06:30 / 07:00 vem de `agendamento-operacao.md` secao 2.2. Apenas o horario das **03:00** esta confirmado em `instrucoes.txt`.
-    - **Agendamento de `SincronizadorFerias`** — frequencia e horario nao evidenciados em codigo nem documentacao.
-    - **Agendamento de `SincronizadorGrupos`** — frequencia e horario nao evidenciados em codigo nem documentacao.
+## Comportamento que exige atenção operacional
 
----
+### Retorno de quarentena NÃO reativa a conta
 
-## Risco operacional
+`ExecutorRetornarQuarentena` apenas move o usuário de volta para a OU original e limpa os metadados (`extensionAttribute` e `info`). Ele **não modifica `userAccountControl`** — confirmado em `ExecutorRetornarQuarentena.cs` (a sequência é `MoveTo` + `CommitChanges` + `Clear()`, sem qualquer operação sobre a flag de conta). Como a conta foi **desabilitada** ao entrar em quarentena (`userAccountControl |= ADS_UF_ACCOUNTDISABLE` em `ExecutorQuarentena`), ela **permanece desabilitada após o retorno**.
 
-!!! danger "Falha silenciosa na verificacao de recontratacao pode deletar conta AD ativa"
-    A acao de exclusao (`07:00`, `SincronizadorAD.exe -executar -acao excluir`) executa uma verificacao de recontratacao antes de deletar a conta. Essa verificacao consulta duas fontes por CPF: **Metadados (HTTP)** e, em seguida, **SAP (SOAP)**, no metodo `VerificarRecontratacao()` de `ExecutorExclusao.cs` (linhas 308-319).
+!!! warning "Reabilitação requer manutenção posterior"
+    Um usuário "retornado" da quarentena volta para a OU certa, mas **continua sem acesso** (conta desabilitada). A reabilitação efetiva depende de uma ação posterior — por exemplo, a ação `manutencao` do `SincronizadorAD`, que limpa `ADS_UF_ACCOUNTDISABLE`. Operacionalmente, não trate "retorno de quarentena concluído" como "acesso restaurado".
 
-    O metodo `VerificarRecontratacaoSAP` (linhas 308-319) realiza a consulta sem tratamento de erro visivel. Se o `WebClient` falhar (timeout, indisponibilidade do servico, erro de rede), o retorno e interpretado como `false` = **"nao encontrado"** = **nao recontratado**, o que **libera a delecao de uma conta AD que poderia estar ativa** (referencia: `agendamento-operacao.md` secao 8.1).
+### BUG: Rename de CN ocorre também em `-consultar`
 
-    **Mitigacao operacional:** garantir disponibilidade de SAP e Metadados durante a janela das 07:00, e monitorar os logs de exclusao (`Log/SincronizadorAD/excluir/`) para falhas de consulta antes de assumir que as exclusoes do dia foram seguras.
+No `SincronizadorGrupos`, quando o `config.txt` da OU define `NomeEmpresa`, o `displayName` recebe o sufixo `({NomeEmpresa})` e o CN é renomeado para refletir o novo `displayName`. A chamada de `Rename` **não está protegida por `ModoConsultar`**:
 
-!!! note "Guarda-corpos relacionados (contexto)"
-    - A verificacao de recontratacao **so se aplica a exclusao por login** (`ExecutorExclusaoPorLogin`). A exclusao por CPF (`ExecutorExclusaoPorCPF`) pula essa verificacao por design (`ExecutorExclusao.cs:300-304`).
-    - Usuarios que ja estao em quarentena tambem nao passam pela verificacao de recontratacao — o fluxo de exclusao segue normalmente (`ExecutorExclusao.cs:290-298`).
-    - A exclusao so executa para contas **inativas** (`userAccountControl & ADS_UF_ACCOUNTDISABLE`); contas ativas retornam erro sem deletar (`ExecutorExclusao.cs:114-133`).
+```csharp
+// ExecutorSincronizadorGrupos.cs:548-550
+if (!displayName_Novo.Equals(userEntry.Properties["cn"].Value))
+{
+    userEntry.Rename("CN=" + displayName_Novo); // executa mesmo em -consultar
+}
+```
 
----
+Diferente das demais mutações desse executável (alteração de `Properties` e `CommitChanges()`, ambas guardadas por `if (ModoConsultar)`), o `Rename` aplica a mudança **imediatamente no AD** (não depende de `CommitChanges`).
 
-## Referencias cruzadas
+!!! danger "Dry-run não é totalmente seguro no SincronizadorGrupos"
+    Rodar `SincronizadorGrupos.exe -consultar` **pode renomear CNs reais no Active Directory** quando há `NomeEmpresa` configurado para a OU e o `displayName` calculado diverge do CN atual. Não confie no modo `-consultar` desse executável como um _dry-run_ completo. Demais campos de perfil e operações de grupo respeitam `ModoConsultar`; apenas o `Rename` de CN não.
 
-- [Ciclo de Vida da Quarentena](../negocio/ciclo-vida-quarentena.md) — detalhamento de negocio do fluxo cross-projeto (entrada, monitoramento, retorno e expiracao), incluindo a regra de ordem `monitorar_quarentena` antes de `expirar_quarentena`.
+## Referências de lógica de negócio
+
+Para a regra de negócio detalhada de cada ação de quarentena (detecção de login pós-quarentena, contagem de dias corridos, validação de OU original, listas de exceção, etc.), consulte a página de [Ciclo de Vida da Quarentena](../negocio/ciclo-vida-quarentena.md). Esta página de DevOps cobre apenas a orquestração temporal e a operação.

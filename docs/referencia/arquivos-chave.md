@@ -1,189 +1,97 @@
 # Arquivos-Chave
 
-Este é o índice de referência técnica da suíte **Sincronizadores GAB**: um mapa dos
-arquivos de código-fonte mais importantes de cada aplicação, com uma frase
-descrevendo a responsabilidade de cada um. Use esta página para localizar
-rapidamente onde uma regra de negócio ou comportamento está implementado.
+Esta página de referência técnica reúne, de forma consolidada, os **arquivos-chave** de cada sub-projeto dos Sincronizadores GAB e a **lista de discrepâncias** verificadas entre a documentação existente e o código-fonte C#.
 
-!!! warning "A fonte de verdade é o código em `src/`"
-    O código C# em `D:/projects/sincronizadoresgab/src` é a **VERDADE**. Os
-    documentos em `docs/` e os arquivos `CLAUDE.md` são **insumos** — apoiam o
-    entendimento, mas podem estar desatualizados. Sempre que um documento divergir
-    do código, **a versão do código vence**.
-
-!!! note "Convenção de caminhos"
-    Todos os caminhos são relativos à raiz do repositório
-    (`D:/projects/sincronizadoresgab`). Os quatro aplicativos são apps console
-    .NET 8.0 (Windows-only, com dependências COM interop ADODB e
-    `System.DirectoryServices`).
+!!! info "A verdade está no código"
+    Todos os caminhos, classes e métodos citados abaixo refletem o estado do código-fonte em `D:/projects/sincronizadoresgab/src`. Onde a documentação de negócio divergir do código, a versão do **código vence** — essas divergências estão registradas na seção [Discrepâncias documento-vs-código](#discrepancias-documento-vs-codigo).
 
 ---
 
-## Sincronizador AD
+## Mapa de arquivos-chave
 
-Aplicação que executa mutações no Active Directory a partir de 10 ações roteadas
-por linha de comando (`-acao`), consumindo requisições abertas no BDesk.
+### Comum (bibliotecas compartilhadas)
 
-| Arquivo | Responsabilidade |
-|---------|------------------|
-| `src/SincronizadorAd/Program.cs` | Ponto de entrada do executável; faz o roteamento do parâmetro `-acao` para o executor correspondente. |
-| `src/SincronizadorAd/ExecutorSincronizadorAd.cs` | Executor principal e contexto compartilhado das ações; contém `GerarSenhaAleatoria` (senha forte com mínimo 8 caracteres, garantindo minúscula/maiúscula/número/especial via secure random) e os defaults de quarentena (ex.: `ExtensionAttributeOuOriginal = "msDS-cloudExtensionAttribute1"`). |
-| `src/SincronizadorAd/Executores/ExecutorAuxiliarBase.cs` | Classe base das 10 ações; expõe a busca de usuários no AD via `ObterUnicoUsuarioAD`/`ObterUsuarioAD` e o controle de status de conta (`userAccountControl`). |
-| `src/SincronizadorAd/Executores/ExecutorInsercao.cs` | Criação de conta: geração de login por algoritmo de 8 tentativas, prefixo `ps.` para prestadores de serviço, cap de 90 dias a partir da data de abertura e disparo condicional dos desdobramentos. |
-| `src/SincronizadorAd/Executores/ExecutorExclusao.cs` | Exclusão de contas por login ou CPF; guarda-corpo `PodeExcluir` (só exclui após a "Data da exclusão efetiva"), verificação de recontratação (apenas na exclusão por login) e exigência de conta inativa. |
-| `src/SincronizadorAd/Executores/ExecutorQuarentena.cs` | Entrada em quarentena via `MoverParaQuarentena`: salva a OU original, move para a OU mensal `5S-{MM-yyyy}`, grava timestamp em `info` e desabilita a conta. |
-| `src/SincronizadorAd/Executores/ExecutorRetornarQuarentena.cs` | Retorno de quarentena: move o usuário de volta à OU original e limpa metadados, com intervalo mínimo de 12 horas; **não** reabilita a conta. |
-| `src/SincronizadorAd/Executores/ExecutorManutencao.cs` | Atualização de dados/senha: gera senha aleatória, busca a requisição de exclusão correspondente em 4 filtros e posta a ação na requisição de exclusão encontrada. |
-| `src/SincronizadorAd/Executores/ExecutorAzure.cs` | Registro de MFA no Azure AD: obtém a identidade direto da requisição BDesk (sem busca no AD), normaliza o telefone e aguarda a sincronização do usuário no Azure. |
+| Arquivo | Propósito |
+|---|---|
+| `src/Sincronizadores.Lib/ExecutorSincronizador.cs` | Classe base de todos os executores. Define a API pública, a **FILA** persistente de requisições BDesk (commit em duas fases via `FILA/` → `ENVIADOS/`) e os métodos de integração com a API REST do BDesk (abrir requisição, postar ação, desdobrar, buscar requisições abertas). |
+| `src/Sincronizadores.Lib/ActiveDirectory.cs` | Constantes de Active Directory. Define `ADS_UF_ACCOUNTDISABLE` (`0x0002`, linha 9) e as demais constantes `ADS_UF_*` usadas nas operações de bit sobre `userAccountControl`. |
+| `src/Cross-Cutting/Security/Cryptography.cs` | Criptografia XOR de credenciais. `Decrypt()` usa as chaves fixas 109 (`EncC1`), 191 (`EncC2`) e 161 (`EncKey`). A geração de valores criptografados é feita via `<exe> -criptografar <valor>`. |
 
-!!! tip "As 10 ações do Sincronizador AD"
-    `inserir`, `atualizar`, `manutencao`, `quarentena`, `retornar_quarentena`,
-    `azure`, `marcar_pendente`, `marcar_pendente_cpf`, `excluir`, `excluir_cpf` —
-    todas herdam de `ExecutorAuxiliarBase`.
+### SincronizadorAD
 
-**Insumos (podem estar desatualizados):**
-`src/SincronizadorAd/CLAUDE.md`, `docs/negocio/sincronizador-ad-regras.md`.
+| Arquivo | Propósito |
+|---|---|
+| `src/SincronizadorAd/Program.cs` | Ponto de entrada. Roteia a execução conforme `-acao` (10 ações). |
+| `src/SincronizadorAd/ExecutorSincronizadorAd.cs` | Executor principal. Define `ExtensionAttributeOuOriginal` (padrão `msDS-cloudExtensionAttribute1`, linha 37), `GerarSenhaAleatoria()` (linhas 422-480) e chama `VerificaListasExcecao` em `AlterarConta` (linha 315). |
+| `src/SincronizadorAd/Executores/ExecutorAuxiliarBase.cs` | Base dos executores auxiliares. `ObterUnicoUsuarioAD()`, `VerificaListasExcecao()` (login e grupo) e `AtualizarStatusConta()` (remove/aplica o bit `ADS_UF_ACCOUNTDISABLE`, linha 281). |
+| `src/SincronizadorAd/Executores/ExecutorInsercao.cs` | Ação `inserir`: geração de login (8 tentativas), senha temporária `@{Letra}{ddMMyyyy}`, cap de 90 dias para prestador (`accountExpires`) e 8 desdobramentos automáticos (SAP, Sistemas, Rede, Internet, Email, VPN, Telefonia, Azure). |
+| `src/SincronizadorAd/Executores/ExecutorManutencao.cs` | Ação `manutencao`: reset de senha aleatória + reativação da conta; posta a ação na requisição de **exclusão** correspondente, não na de manutenção. |
+| `src/SincronizadorAd/Executores/ExecutorQuarentena.cs` | Ação `quarentena`: salva a OU original no extensionAttribute, move para a OU mensal `5S-{MM-yyyy}`, grava timestamp em `info` e desabilita a conta (`userAccountControl |= ADS_UF_ACCOUNTDISABLE`). |
+| `src/SincronizadorAd/Executores/ExecutorRetornarQuarentena.cs` | Ação `retornar_quarentena`: lê a OU original do extensionAttribute, move de volta e limpa metadados. **Nunca** altera `userAccountControl`. Intervalo mínimo de 12h apenas quando o atributo está vazio (linha 15). |
+| `src/SincronizadorAd/Executores/ExecutorExclusao.cs` | Ação `excluir` (base): verifica recontratação, exige conta desabilitada, envia para lixeira recursivamente e abre desdobramento com `MemberOf`. |
+| `src/SincronizadorAd/Executores/ExecutorExclusaoPorLogin.cs` | Exclusão por login/`sAMAccountName` (com verificação de recontratação). |
+| `src/SincronizadorAd/Executores/ExecutorExclusaoPorCPF.cs` | Exclusão por CPF; desabilita a verificação de recontratação via checagem `this is ExecutorExclusaoPorCPF`. |
+| `src/SincronizadorAd/Executores/ExecutorAzure.cs` | Ação `azure`: MFA via Microsoft Graph. Não consulta o AD — identidade vem dos campos BDesk (`UserPrincipalName` em "DADOS DO USUÁRIO AZURE"). |
+| `src/SincronizadorAd/Executores/ExecutorAtualizacao.cs` | Ação `atualizar`: modifica `title` (Cargo), `department` (Departamento) e `postalCode` (Centro de Custo) por CPF. |
+| `src/SincronizadorAd/Executores/ExecutorMarcarPendenteExclusao.cs` | Ações `marcar_pendente` / `marcar_pendente_cpf`: desabilita a conta (`userAccountControl |= ADS_UF_ACCOUNTDISABLE`). |
+| `src/SincronizadorAd/ServicoSincronizadorAd.cs` | `ObterUsuarioAD()`: monta o filtro LDAP por login ou CPF conforme a ação. |
 
----
+### SincronizadorSAP
 
-## Sincronizador SAP
+| Arquivo | Propósito |
+|---|---|
+| `src/SincronizadorSAP/ExecutorSincronizadorSAP.cs` | Executor principal. Passada principal (merge SAP+Metadados+AD), `Comparar_ViaRegraNova` (CPF excluído só se 100% dos registros estiverem desligados), `Agregar()`, `ObterUsuariosAD()` (query LDAP via ADODB) e `ExecutarQuarentena()`. |
+| `src/SincronizadorSAP/ServicoSincronizadorSAP.cs` | Comparação de campos (`Diferentes()`, case-insensitive, só DA16/DA19), `MapearSolicitante()` (última OU não-DC, com fallback) e montagem dos JSONs BDesk. |
+| `src/SincronizadorSAP/Acoes/AcaoSincronizadorSAP.cs` | Base das ações de quarentena. `BuscarUsuariosNaQuarentena()` (DirectorySearcher subtree, PageSize 1000), `EstaEmListaExcecao()`, `ParseTimestampQuarentena()` e `JaExisteRequisicaoAberta()`. |
+| `src/SincronizadorSAP/Acoes/AcaoMonitorarQuarentena.cs` | Ação `monitorar_quarentena`: detecta login pós-quarentena (`lastLogonTimestamp` > timestamp de entrada) e abre requisição de retorno. |
+| `src/SincronizadorSAP/Acoes/AcaoExpirarQuarentena.cs` | Ação `expirar_quarentena`: detecta 30+ dias em quarentena sem login posterior e abre requisição de exclusão (template `excluir-definitivo.json`). |
+| `src/SincronizadorSAP/Program.cs` | Ponto de entrada. Roteia a passada principal e as ações de quarentena. |
+| `src/SincronizadorSAP/ServicoSincronizadorSAP.cs` | (ver acima — serviço de domínio compartilhado pela passada e pelas ações). |
 
-Passada principal que sincroniza usuários de três origens (SAP HR via SOAP, Metadados
-via HTTP e Active Directory via ADODB) produzindo colações de Novos/Alterados/Excluidos
-para abertura de requisições no BDesk, além de gerenciar o ciclo de quarentena.
+### SincronizadorFerias
 
-| Arquivo | Responsabilidade |
-|---------|------------------|
-| `src/SincronizadorSAP/ExecutorSincronizadorSAP.cs` | Orquestra o *main pass*: merge das três fontes, regra nova de exclusão (100% desligados por CPF normalizado), limites de lote por execução e deduplicação por janela de 7 dias (`LocalData/yyyyMMdd.json`). |
-| `src/SincronizadorSAP/ServicoSincronizadorSAP.cs` | Serviços de domínio: `DicionarioDeDados`, `CamposAComparar` (apenas DA16/Cargo e DA19/Centro de Custo), `MapearSolicitante` (participante ANTE derivado da última OU do DN) e `Diferentes` (comparação case-insensitive). |
-| `src/SincronizadorSAP/Acoes/AcaoSincronizadorSAP.cs` | Base das ações de quarentena; provê `ParseTimestampQuarentena` (parse do prefixo `"Movido para quarentena em "`), `ParseLastLogonTimestamp` e `ObterDiasParaExpiracao` (config ou default 30). |
-| `src/SincronizadorSAP/Acoes/AcaoMonitorarQuarentena.cs` | Ação `monitorar_quarentena`: detecta login pós-quarentena (`lastLogonTimestamp > timestamp`) e abre requisição de retorno, com deduplicação via API de requisições abertas. |
-| `src/SincronizadorSAP/Acoes/AcaoExpirarQuarentena.cs` | Ação `expirar_quarentena`: detecta inatividade por `DiasParaExpiracao` (30 dias padrão) sem login posterior e abre exclusão definitiva, com deduplicação via API. |
+| Arquivo | Propósito |
+|---|---|
+| `src/SincronizadorFerias/ExecutorSincronizadorFerias.cs` | Pipeline de 17 passos. Manipula `accountExpires` (FILETIME), o watermark `:CheckedOut:` em `streetAddress`, os grupos L1/L2, filtros (CPF, deduplicação, cargos proibidos, empresa, listas negras) e o limite `QuantidadeMaximaDeAtualizacoes`. |
+| `src/SincronizadorFerias/ServicoSincronizadorFerias.cs` | Conversão de `accountExpires` (MaxValue/0 → `DataDeExpiracaoDaConta = null`) e correlação por `CPF.SomenteDigitos()`. Injeção SQL de férias (Metadados SQL) somente para CPFs presentes no banco. |
+| `src/SincronizadorFerias/Model/UsuarioAD.cs` | Modelo do usuário lido do Active Directory. |
+| `src/SincronizadorFerias/Model/UsuarioOrigem.cs` | Modelo do usuário das origens (SAP / Metadados HTTP / Metadados SQL). |
+| `src/SincronizadorFerias/Model/UsuarioJoin.cs` | Modelo do join entre AD e origem usado na comparação. |
 
-**Insumos (podem estar desatualizados):**
-`src/SincronizadorSAP/CLAUDE.md`, `docs/negocio/sincronizador-sap-regras.md`,
-`CLAUDE.md` (raiz).
+### SincronizadorGrupos
 
----
-
-## Sincronizador Férias
-
-Automatiza a sincronização de períodos de férias entre SAP, Metadados (HTTP e SQL)
-e Active Directory, desabilitando contas via `accountExpires` e mantendo um
-*watermark* `:CheckedOut:` no campo `streetAddress`.
-
-| Arquivo | Responsabilidade |
-|---------|------------------|
-| `src/SincronizadorFerias/ExecutorSincronizadorFerias.cs` | Núcleo do app: merge das 3 fontes por `CPF.SomenteDigitos()`, comparação L1 (novas entradas) / L2 (retornos/atualizações), ordenação com *nulls first* (retornos antes de entradas), *watermark*, truncamento de `streetAddress` a 1020 caracteres e limite de lote pós-ordenação. |
-| `src/SincronizadorFerias/ServicoSincronizadorFerias.cs` | Montagem dos usuários a partir das fontes e a consulta SQL que injeta as datas de férias dos usuários de Metadados (HTTP) por CPF. |
-| `src/SincronizadorFerias/Model/UsuarioOrigem.cs` | Modelo do usuário vindo das fontes de origem (SAP/Metadados), incluindo `DataDeExpiracaoDaConta`. |
-| `src/SincronizadorFerias/Model/UsuarioAD.cs` | Modelo do usuário lido do Active Directory (estado atual de `accountExpires`, `streetAddress`/`LogAlteracao`, cargo). |
-| `src/SincronizadorFerias/Model/UsuarioJoin.cs` | Modelo do par correlacionado origem × AD (`UsuarioOrigem` + `UsuarioAD`) usado nas comparações L1/L2. |
-
-!!! note "Regra-chave de decisão"
-    `DataDeExpiracaoDaConta = InicioFerias` **somente se** `FinalFerias > DateTime.Now.Date`.
-    Quando as férias terminam, o valor vira `null` → dispara o caminho de retorno
-    (e `accountExpires` recebe `"0"` / *never expires*).
-
-**Insumos (podem estar desatualizados):** `src/SincronizadorFerias/CLAUDE.md`.
+| Arquivo | Propósito |
+|---|---|
+| `src/SincronizadorGrupos/ExecutorSincronizadorGrupos.cs` | Executor principal. Sincroniza 6 campos de perfil e grupos por OU, backup integral, teto `MaximoAlteracoesPorExecucao`, remoção de grupos desabilitada (`if(false)`) e sumário CSV. |
+| `src/SincronizadorGrupos/Program.cs` | Ponto de entrada. Roteia `-executar` / `-consultar`. |
+| `src/SincronizadorGrupos/instrucoes-configuracao/EXEMPLOS/conf.ini` | Exemplo de configuração: seções `[Geral]`, `[ActiveDirectory]`, `[BDesk]`. |
+| `src/SincronizadorGrupos/instrucoes-configuracao/EXEMPLOS/abertura.json` | Template JSON de abertura de requisição BDesk. |
+| `src/SincronizadorGrupos/instrucoes-configuracao/EXEMPLOS/encerramento.json` | Template JSON de encerramento imediato (auditoria no mesmo ciclo). |
 
 ---
 
-## Sincronizador Grupos
+## Discrepâncias documento-vs-código {#discrepancias-documento-vs-codigo}
 
-Audita e sincroniza a associação de usuários a grupos de AD e campos de perfil,
-organizados em árvore hierárquica de OUs com configuração descentralizada por
-`config.txt`.
+!!! warning "Regra de precedência"
+    Quando a documentação existente diverge do código, **o código prevalece**. A tabela abaixo consolida as divergências verificadas. Os arquivos de documentação citados (ex.: `docs/negocio/sincronizador-ad-regras.md`, `docs/business-requirements/sincronizacao-ad-quarentena/prd-automacao-quarentena.md`) são insumos e podem estar desatualizados.
 
-| Arquivo | Responsabilidade |
-|---------|------------------|
-| `src/SincronizadorGrupos/ExecutorSincronizadorGrupos.cs` | Núcleo do app: teto de alterações por execução (`MaximoAlteracoesPorExecucao`), backup integral pré-execução, busca LDAP `SearchScope.OneLevel`, sufixo/rename de CN via `NomeEmpresa`, adição-apenas a grupos (remoção encapsulada em `if(false)`) e sumário CSV por execução. |
-| `src/SincronizadorGrupos/Program.cs` | Ponto de entrada do executável e parsing dos parâmetros de linha de comando (`-executar`/`-consultar`). |
+| Tema | O que o documento dizia | O que o código diz | Arquivo do doc |
+|---|---|---|---|
+| Descrição da OU mensal de quarentena | Descrição usaria `{nomeOu}` (ex.: "OU de quarentena para 5S-03-2026") | Deveria usar `{MM-yyyy}`: `description = $"OU de quarentena para {DateTime.Now:MM-yyyy}"`, resultando em "OU de quarentena para 03-2026" (sem o prefixo `5S-`). Verificado em `ExecutorQuarentena.cs`. | `docs/negocio/sincronizador-ad-regras.md` |
+| Retorno de quarentena reativa a conta | PRD afirma que o retorno reabilitaria a conta | O retorno **nunca** modifica `userAccountControl`; a conta permanece desabilitada. A reabilitação é passo separado, via `manutencao`. Verificado em `ExecutorRetornarQuarentena.cs:87-100`. | `prd-automacao-quarentena.md:81` |
+| Intervalo mínimo de 12h no retorno | Intervalo de 12h aplicado sempre entre execuções | O intervalo de 12h só se aplica **quando o `extensionAttribute` está vazio** (OU original não recuperável). Valor fixo, não parametrizável. O PRD não menciona. `ExecutorRetornarQuarentena.cs:15`. | `prd-automacao-quarentena.md` |
+| Deduplicação de exclusões no SAP | Deduplicação por CPF na janela de 7 dias | A deduplicação é por **login/`sAMAccountName`**, não por CPF. Janela `DiasDeEsperaPorExclusoes` (default 7). Verificado em `ExecutorSincronizadorSAP.cs`. | `infraestrutura-deploy.md` |
+| Query PageSize 10000 / Timeout 30s | Atribuída a uma consulta SAP SOAP | É a query **LDAP do Active Directory via ADODB** (`ObterUsuariosAD`), não SAP SOAP. | `infraestrutura-deploy.md` |
+| Remoção de prestadores | Filtraria por padrão genérico `ps.*` | Filtra login iniciando por `ps.` (`RemoverComPS` usa `StartsWith("ps.", OrdinalIgnoreCase)`). | — |
+| Injeção de férias via SQL (Ferias) | SQL sobrescreveria sempre os valores HTTP | A injeção SQL (`INICIOPROGFERIAS`/`TERMINOPROGFERIAS`) só ocorre para **CPFs presentes no banco**; usuários ausentes mantêm os campos HTTP. `ServicoSincronizadorFerias.cs`. | — |
+| Normalização de celular no Azure | Sempre prepende `55` e `+` | Só prepende `55` e `+` para números com **≤ 11 dígitos**; números maiores ficam `+{numeroOriginal}`. `ExecutorAzure.cs`. | — |
+| Listas de exceção no SAP | Aplicar-se-iam a todas as ações, inclusive `inserir` | O filtro de exceção AD **não se aplica a `inserir`** (`Agregar`: `if (acao != "inserir")`). `ExecutorSincronizadorSAP.cs:939-955`. | — |
+| Rename de CN em modo consulta (Grupos) | Rename protegido por `ModoConsultar` | O `userEntry.Rename()` ocorre mesmo em `-consultar` (bug não protegido). `ExecutorSincronizadorGrupos.cs:548-550`. | `agendamento-operacao.md` |
+| `[ActiveDirectory] Caminho` (Grupos) | Validado na inicialização | `Caminho` é obrigatório em runtime (linha 302) mas **não validado na init** — latent bug (`KeyNotFoundException` se ausente). `ExecutorSincronizadorGrupos.cs`. | — |
+| `MaximoAlteracoesPorExecucao` (Grupos) | Teria default | Lido da config **sem default hardcoded** visível. `ExecutorSincronizadorGrupos.cs:121`. | — |
+| Quarentena "sem alterações no banco BDesk" | PRD afirma não haver alterações no BDesk | O código **abre requisições via API REST** do BDesk no fluxo de quarentena. | `prd-automacao-quarentena.md` |
+| Template de expiração de quarentena | Usaria o `MontarJSONExclusao` tradicional | `AcaoExpirarQuarentena` usa o template `excluir-definitivo.json` (fluxo próprio de quarentena). `AcaoExpirarQuarentena.cs`. | — |
+| `JaExisteRequisicaoAberta` | Filtraria corretamente por requisição aberta do mesmo login | Deveria filtrar por **`AtividadeId` específico**, não apenas pelo `nomeConjunto` (correção recomendada). `AcaoSincronizadorSAP.cs`. | — |
 
-!!! warning "Remoção de grupos desabilitada e rename em dry-run"
-    O bot **nunca remove** usuários de grupos (o bloco `REMOVE` está em `if(false)`),
-    apenas adiciona. Há ainda uma divergência conhecida: o `Rename` de CN executa
-    mesmo em modo `-consultar` (dry-run), sem a proteção `if(!ModoConsultar)` usada
-    nos demais campos — comportamento registrado como bug.
-
-**Insumos (podem estar desatualizados):**
-`src/SincronizadorGrupos/CLAUDE.md`, `docs/negocio/sincronizador-grupos-regras.md`,
-`CLAUDE.md` (raiz).
-
----
-
-## Componentes comuns (Cross-Cutting / Atendame.Core)
-
-Bibliotecas compartilhadas entre os quatro aplicativos.
-
-| Arquivo | Responsabilidade |
-|---------|------------------|
-| `src/Atendame.Core/Versao.cs` | Define a constante `Release` (placeholder `"(em desenvolvimento)"`), consumida pelo token `%VERSAO%` nos templates BDesk e no *watermark* de férias. |
-| `src/Cross-Cutting/Security/Cryptography.cs` | Criptografia XOR de credenciais (chaves fixas `EncKey=161`, `EncC1=109`, `EncC2=191`); usada pelo utilitário CLI `-criptografar`. |
-| `src/Cross-Cutting/GerenciadorVersao.cs` | Carrega as *feature flags* (`BooleanosVersao`) a partir de `funcionalidades.txt` (localizado via variável de ambiente `%BUSINESS_DESK%`). |
-
-!!! warning "Discrepância de caminho — briefing × código"
-    O briefing indicava `src/Atendame.Core/Cryptography.cs` e
-    `src/Atendame.Core/GerenciadorVersao.cs`. Na verdade, no código esses arquivos
-    estão em **`src/Cross-Cutting/Security/Cryptography.cs`** e
-    **`src/Cross-Cutting/GerenciadorVersao.cs`**. Apenas `Versao.cs` reside em
-    `src/Atendame.Core/`. Como o código é a fonte de verdade, prevalecem os
-    caminhos de `Cross-Cutting`.
-
----
-
-## Exemplos de configuração
-
-Modelos de referência (INI + JSON) para configurar cada aplicação. Servem de ponto
-de partida — os valores em produção são definidos por servidor.
-
-| Arquivo | Responsabilidade |
-|---------|------------------|
-| `src/SincronizadorSAP/EXEMPLOS/SECRETOS/conf.ini` | Exemplo de `conf.ini` do Sincronizador SAP: seções `[SAP]`, `[Metadados]`, `[ActiveDirectory]` e `[BDesk]`, com credenciais criptografadas (placeholder), IDs de atividades e limites de lote. |
-| `src/SincronizadorSAP/EXEMPLOS/RODAVEIS/config.json` | Exemplo de `config.json` *rodável* do SAP: bloco `[ActiveDirectory][Quarentena]` com `OuDestino`, `DiasInatividade` (ex.: 90), `MaximoAbertura` (ex.: 2) e `ExtensionAttributeOuOriginal`. |
-| `src/SincronizadorAd/EXEMPLOS/CONFIG/config.json` | Exemplo de `config.json` do Sincronizador AD: parâmetros de quarentena e do Azure MFA (`TempoEsperaEmHoras`) usados pelas 10 ações. |
-| `src/SincronizadorGrupos/instrucoes-configuracao/EXEMPLOS/conf.ini` | Exemplo de `conf.ini` do Sincronizador Grupos, modelo de configuração geral do app. |
-
-!!! tip "Mais exemplos disponíveis"
-    Há ainda 43 templates de ação em `src/SincronizadorAd/EXEMPLOS/CONFIG/`
-    (cobrindo todas as 10 ações) e os templates de quarentena do SAP em
-    `src/SincronizadorSAP/EXEMPLOS/RODAVEIS/` (ex.: `retornar-quarentena.json`,
-    `excluir-definitivo.json`).
-
----
-
-## Ciclo de vida da quarentena (cross-project)
-
-O ciclo de quarentena é um fluxo que atravessa o Sincronizador SAP (deteta e abre
-requisições) e o Sincronizador AD (executa as operações). Os arquivos-chave já
-listados acima participam deste fluxo na seguinte ordem:
-
-1. **`ExecutorQuarentena.cs`** (AD, `-acao quarentena`) — entrada em quarentena.
-2. **`AcaoMonitorarQuarentena.cs`** (SAP, `-acao monitorar_quarentena`) — deteta login pós-quarentena e abre requisição de retorno.
-3. **`AcaoExpirarQuarentena.cs`** (SAP, `-acao expirar_quarentena`) — deteta inatividade e abre exclusão definitiva.
-4. **`ExecutorRetornarQuarentena.cs`** (AD, `-acao retornar_quarentena`) — move o usuário de volta.
-5. **`ExecutorExclusao.cs`** (AD, `-acao excluir`) — exclui contas expiradas.
-
-A base `AcaoSincronizadorSAP.cs` provê o parse do *timestamp* gravado por
-`ExecutorQuarentena.cs`, garantindo o acoplamento entre os dois aplicativos.
-
-**Insumos (podem estar desatualizados):**
-`docs/business-requirements/sincronizacao-ad-quarentena/prd-automacao-quarentena.md`,
-`docs/plans/2026-03-04-quarentena-lifecycle-design.md`.
-
----
-
-## Documentos de origem (insumos)
-
-Os arquivos abaixo descrevem regras e operação, mas são **insumos** — quando
-divergirem do código em `src/`, o código prevalece.
-
-- `docs/negocio/sincronizador-ad-regras.md`
-- `docs/negocio/sincronizador-sap-regras.md`
-- `docs/negocio/sincronizador-grupos-regras.md`
-- `docs/devops/agendamento-operacao.md`
-- `docs/devops/configuracao-servidores.md`
-- `docs/devops/infraestrutura-deploy.md`
-- `docs/business-requirements/sincronizacao-ad-quarentena/prd-automacao-quarentena.md`
-- `docs/plans/2026-03-04-quarentena-lifecycle-design.md`
-- `CLAUDE.md` (raiz) e os `CLAUDE.md` de cada sub-projeto.
+!!! tip "Defaults confirmados em código"
+    Como contraponto às discrepâncias, alguns valores de documentação foram **confirmados** no código: `DiasDeEsperaPorExclusoes` default `7` (`ExecutorSincronizadorSAP.cs`), `DiasParaExpiracao` default `30` (`AcaoSincronizadorSAP.cs:135`, `?? 30`), e `DiasInatividade=90` obrigatório sem fallback (`ExecutorSincronizadorSAP.cs:1221`).

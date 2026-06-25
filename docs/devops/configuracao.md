@@ -1,242 +1,277 @@
-# Configuracao
+# Configuração
 
-Esta pagina documenta o modelo completo de configuracao da suite **Sincronizadores GAB**: arquivos INI (`conf.ini`), arquivos JSON (`config.json`, templates de acao e mapeamento de participantes) e as listas negras / whitelist em texto puro. Tambem cobre o marcador (*watermark*) gravado pelo SincronizadorFerias e as feature flags carregadas de `funcionalidades.txt`.
+Os Sincronizadores GAB usam um modelo de configuração em **três camadas** complementares, cada uma com um papel bem definido:
 
-!!! info "Onde ficam os arquivos"
-    Em producao, cada aplicacao e implantada em `F:\BusinessDesk\ASK\{NomeDoExe}\`. Os arquivos de configuracao ficam relativos ao executavel: credenciais e parametros gerais em `conf.ini`; parametros estruturados e templates sob `CONFIG/`; listas negras / whitelist em `../ConfigComum/` e em `CONFIG/`.
+| Camada | Arquivo(s) | Papel |
+| --- | --- | --- |
+| **INI** | `conf.ini` | Infraestrutura e parâmetros operacionais (servidores, URLs, limites de lote, credenciais cifradas). |
+| **JSON** | `config.json` + templates por ação | Configuração de comportamento (quarentena, Azure) e modelos de requisição/ação BDesk. |
+| **Credenciais XOR** | valores embutidos no `conf.ini` | Logins, senhas e tokens cifrados com algoritmo XOR de chaves fixas. |
 
----
-
-## Visao geral das tres camadas
-
-| Camada | Arquivo(s) | Finalidade |
-|--------|------------|------------|
-| **INI** | `conf.ini` | Credenciais (criptografadas XOR), endpoints, IDs de atividade BDesk, limites de lote, flags por app |
-| **JSON** | `config.json`, templates de acao, `mapeamento-participantes.json` | Parametros de quarentena/Azure, templates de requisicao BDesk com tokens, mapeamento OU -> solicitante |
-| **Texto** | listas negras e whitelist (`.txt`) | Whitelist/blacklist de grupos AD, logins e CPFs (1 entrada por linha) |
+!!! info "Princípio geral"
+    O `conf.ini` define **onde** o sistema atua (endpoints, credenciais, limites). Os `config.json` e os templates definem **como** ele atua (ações, OUs, tokens de substituição). As listas negras definem **quem** é incluído ou excluído.
 
 ---
 
-## Camada INI — `conf.ini`
+## 1. Camada INI: `conf.ini`
 
-O `conf.ini` e organizado em **secoes por dominio** (`[ActiveDirectory]`, `[SAP]`, `[Metadados]`, `[BDesk]`, etc.). O parsing e feito por `DictionaryComMensagensMelhores`, que produz mensagens de erro mais claras quando uma chave esperada esta ausente.
+Cada aplicação tem o seu próprio `conf.ini`, dividido em seções. A validação de campos obrigatórios é feita por um dicionário `CamposObrigatoriosIni` em cada executor; **se um campo obrigatório faltar, a inicialização lança exceção e a execução é abortada** antes de qualquer mutação no Active Directory.
 
-### Validacao no startup
+### 1.1 SincronizadorSAP e SincronizadorAD
 
-Cada aplicacao valida o `conf.ini` na inicializacao contra a lista `CamposObrigatoriosIni`. **Se faltar qualquer campo obrigatorio, o app aborta** antes de qualquer mutacao.
+Ambas as aplicações compartilham a mesma estrutura de seções no `conf.ini`.
 
-Campos obrigatorios por secao (confirmados em codigo):
+#### `[ActiveDirectory]`
 
-| Secao | Campos obrigatorios |
-|-------|---------------------|
-| `[ActiveDirectory]` | `Servidor`, `Caminho`, `Login`, `Senha`, `CampoCPF` (mais `DiasDeEsperaPorExclusoes` para AD/SAP) |
-| `[SAP]` | `URL`, `Login`, `Senha` |
-| `[Metadados]` | `URL`, `Login`, `Senha`, `DeveProcessar` |
-| `[BDesk]` | `URL`, `Token` (mais IDs de atividade, limites, origem e solicitante para o SAP) |
+| Chave | Descrição | Cifrada (XOR) |
+| --- | --- | --- |
+| `Servidor` | Host/IP do controlador de domínio (LDAP / ADODB). | Não |
+| `Caminho` | DN base da árvore AD (ex.: `DC=herocorp,DC=com,DC=br`). | Não |
+| `Login` | Conta de serviço com permissão R/W no AD. | **Sim** |
+| `Senha` | Senha da conta de serviço. | **Sim** |
+| `CampoCPF` | Atributo AD que armazena o CPF (chave de correlação). | Não |
 
-!!! warning "Falha tardia: `AtividadeExcluir`"
-    Nem todos os campos sao validados no startup. `AtividadeExcluir` **nao** consta em `CamposObrigatoriosIni` (`ServicoSincronizadorSAP.cs:188-209`). Sua ausencia so causa erro em runtime, quando `MontarJSONExclusao` (`ServicoSincronizadorSAP.cs:442`) tenta ler `config["BDesk"]["AtividadeExcluir"]` — ou seja, somente quando ha requisicoes de exclusao a processar. Confirme que essa chave esteja presente mesmo que a validacao inicial passe.
+#### `[SAP]`
 
-### Credenciais criptografadas (XOR)
+| Chave | Descrição | Cifrada (XOR) |
+| --- | --- | --- |
+| `URL` | Endpoint SOAP do SAP HR. | Não |
+| `Login` | Usuário SAP. | **Sim** |
+| `Senha` | Senha SAP. | **Sim** |
 
-Os campos `Login`/`Senha` de `[SAP]`, `[Metadados]`, `[ActiveDirectory]` e `[BDesk]` sao armazenados **criptografados** e decriptados em runtime.
+#### `[Metadados]`
 
-- Algoritmo: cifra XOR com chaves fixas em `Cryptography.cs:10-12` — `EncKey=161`, `EncC1=109`, `EncC2=191`.
-- Geracao do valor cifrado:
+| Chave | Descrição | Cifrada (XOR) |
+| --- | --- | --- |
+| `URL` | Endpoint HTTP do serviço Metadados. | Não |
+| `Login` | Usuário Metadados. | **Sim** |
+| `Senha` | Senha Metadados. | **Sim** |
+| `DeveProcessar` | `true`/`false`. Em modo não-consulta, controla se Metadados é sincronizado. | Não |
 
-```bat
+#### `[BDesk]`
+
+| Chave | Descrição | Padrão / Observação |
+| --- | --- | --- |
+| `URL` | Endpoint REST da API BDesk. | — |
+| `Token` | Bearer token OAuth (cifrado). | **XOR** |
+| `Formulario` | Formulário BDesk usado nas requisições. | — |
+| `AtividadeInserir` | ID de atividade para inserção. | — |
+| `AtividadeAtualizar` | ID de atividade para atualização. | — |
+| `AtividadeExcluir` | ID de atividade para exclusão. | — |
+| `Criticidade` | Criticidade aplicada às requisições. | — |
+| `QuantidadeMaximaDeInsercoes` | Teto de inserções por execução. | `0` = sem limite |
+| `QuantidadeMaximaDeAtualizacoes` | Teto de atualizações por execução. | `0` = sem limite |
+| `QuantidadeMaximaDeExclusoes` | Teto de exclusões por execução. | `0` = sem limite |
+| `DiasDeEsperaPorExclusoes` | Janela de deduplicação de exclusões (por `sAMAccountName`, via `LocalData/yyyyMMdd.json`). | `7` (default no código; `EXEMPLOS/SECRETOS` sobrescreve para `14`) |
+| `Solicitante` | Login solicitante de fallback quando o mapeamento por OU não resolve. | — |
+| `Telefone` | Telefone usado nas requisições. | — |
+| `Origem` | Origem das requisições. | — |
+| `ExecutarSomenteUsuariosDaListaDeUsuariosPermitidos` | Ativa a whitelist `usuarios-permitidos.txt`. | `true` ativa whitelist |
+
+!!! note "Deduplicação de exclusões"
+    A deduplicação remove do lote qualquer **login (sAMAccountName)** já submetido em `LocalData/yyyyMMdd.json` dentro da janela de `DiasDeEsperaPorExclusoes`. **Não há deduplicação por CPF.**
+
+### 1.2 SincronizadorFerias
+
+O SincronizadorFerias herda as seções `[ActiveDirectory]`, `[SAP]` e `[BDesk]` (mesmas chaves descritas acima) e acrescenta uma fonte de dados SQL própria.
+
+#### `[BancoDeDadosMetadados]` (SQL / OleDb)
+
+| Chave | Descrição | Cifrada (XOR) |
+| --- | --- | --- |
+| `Servidor` | Host do SQL Server. | Não |
+| `Banco` | Nome do banco de dados. | Não |
+| `Login` | Usuário do banco. | **Sim** |
+| `Senha` | Senha do banco. | **Sim** |
+| `View` | View consultada para datas de programação de férias. | Não |
+
+!!! tip "Por que SQL no SincronizadorFerias?"
+    Os dados de férias do Metadados SQL (`INICIOPROGFERIAS` / `TERMINOPROGFERIAS`) são injetados nos usuários do Metadados HTTP **apenas** para CPFs que existem no banco. Usuários presentes no HTTP mas ausentes no SQL mantêm os campos de férias como `null`.
+
+### 1.3 SincronizadorGrupos
+
+#### `[Geral]`
+
+| Chave | Descrição | Obrigatório |
+| --- | --- | --- |
+| `CaminhoDados` | Raiz da árvore de `config.txt` por OU (estrutura espelhada). | **Sim** |
+| `CaminhoBackups` | Destino do backup integral por execução. | **Sim** |
+| `MaximoAlteracoesPorExecucao` | Teto de usuários alterados por execução. | **Sim** (lido sem default visível) |
+
+Além de `[Geral]`, o SincronizadorGrupos usa `[ActiveDirectory]` e `[BDesk]`.
+
+!!! warning "Discrepância confirmada: latent bug em `[ActiveDirectory] Caminho`"
+    No SincronizadorGrupos, a chave **`[ActiveDirectory] Caminho` é usada obrigatoriamente em tempo de execução** (em `ExecutorSincronizadorGrupos.cs`, linha 302), mas **NÃO está incluída** no `CamposObrigatoriosIni` validado na inicialização (linhas 25-30). Se `Caminho` estiver ausente, o sistema **lança `KeyNotFoundException` em tempo de execução** em vez de uma mensagem de validação clara. A chave `CaminhoGrupos` é verdadeiramente opcional (verificada via `ContainsKey` na linha 304).
+
+!!! warning "Discrepância confirmada: `[BDesk]` e o modo FILA-MODO-CONSULTA"
+    A seção `[BDesk]` (`URL` + `Token`) é obrigatória **apenas em modo `-executar`**. Em `-consultar` é validada condicionalmente. Quando `[BDesk]` existe mas `Executar != "true"`, ativa-se o **modo FILA-MODO-CONSULTA**: as requisições são escritas na fila local, mas **nenhuma requisição BDesk é aberta** (linhas 216-220). Esse mesmo comportamento de `Executar != "true"` rege o SincronizadorFerias, que grava em `FILA-MODO-CONSULTA/` e nunca submete requisições.
+
+---
+
+## 2. Camada de Criptografia XOR
+
+Credenciais sensíveis (`Login`, `Senha`, `Token`) são armazenadas cifradas no `conf.ini`. O algoritmo está em `src/Cross-Cutting/Security/Cryptography.cs` e usa **chaves fixas** embutidas no código:
+
+| Constante | Valor |
+| --- | --- |
+| `EncC1` | `109` |
+| `EncC2` | `191` |
+| `EncKey` | `161` |
+
+A descriptografia (`Decrypt`) deriva a chave inicial de `(EncKey * EncC1 + EncC2) % 65536` e aplica XOR byte a byte sobre a representação numérica do valor. O método `Encrypt` faz o caminho inverso, produzindo uma string de dígitos.
+
+### Gerar um valor cifrado
+
+Cada executável aceita o parâmetro `-criptografar`, que imprime o valor cifrado no **stdout**:
+
+```text
 SincronizadorSAP.exe -criptografar <valor>
 ```
 
-O comando imprime o valor cifrado em stdout para ser colado no `conf.ini`.
+O resultado deve ser copiado para a chave correspondente no `conf.ini` (`Login`, `Senha` ou `Token`).
 
-!!! note "Seguranca da cifra XOR"
-    As chaves XOR sao fixas e embutidas no codigo. A criptografia ofusca as credenciais no arquivo, mas nao deve ser tratada como protecao criptografica forte.
-
-### Feature flags — `funcionalidades.txt`
-
-As feature flags sao carregadas em `GerenciadorVersao.VersaoLendoDoArquivo()` (`src/Cross-Cutting/GerenciadorVersao.cs:14`) a partir de:
-
-```text
-Path.Combine(%BUSINESS_DESK%, "funcionalidades.txt")
-```
-
-O arquivo e lido linha a linha; cada linha e comparada (apos `Trim().ToLower()`) contra os nomes dos campos `bool` de `BooleanosVersao` (20+ flags). Uma flag fica `true` quando seu nome aparece como uma linha do arquivo; caso contrario permanece `false`. Se o arquivo nao existir, todas as flags ficam em seu valor padrao (`false`).
-
-!!! tip "A confirmar"
-    O setup da variavel de ambiente `%BUSINESS_DESK%` e o caminho real de `funcionalidades.txt` em producao ainda precisam ser confirmados contra os hosts. Veja a secao [A confirmar](#a-confirmar).
+!!! warning "Limitação de segurança"
+    As chaves de criptografia são **fixas e embutidas no binário**. O algoritmo XOR oferece apenas ofuscação — não substitui um cofre de segredos. O acesso aos arquivos `conf.ini` e aos binários deve ser controlado por permissões de sistema de arquivos.
 
 ---
 
-## Camada JSON — `config.json`
+## 3. Camada JSON: `config.json` (por ação)
 
-O `config.json` (sob `CONFIG/`) guarda parametros estruturados de quarentena, do Azure MFA e o caminho de templates compartilhados.
+O `config.json` configura o comportamento das ações que não cabem no INI, principalmente quarentena (SincronizadorAD/SAP) e Azure (SincronizadorAD).
 
-### `[ActiveDirectory][Quarentena]`
+### 3.1 Bloco `ActiveDirectory.Quarentena`
 
-| Campo | Obrigatorio | Default | Descricao |
-|-------|-------------|---------|-----------|
-| `OuDestino` | Sim | — | OU raiz de quarentena (sob ela sao criadas as OUs mensais `5S-{MM-yyyy}`) |
-| `DiasInatividade` | **Sim** | — (lido via `ToObject<int>()`) | Dias sem login para entrar em quarentena (exemplo: `90`) |
-| `MaximoAbertura` | **Sim** | — (lido via `ToObject<int>()`) | Maximo de requisicoes de quarentena abertas por execucao (exemplo: `2`) |
-| `DiasParaExpiracao` | Nao | `30` | Dias em quarentena sem login posterior antes da exclusao definitiva (`AcaoSincronizadorSAP.cs:135`) |
-| `ExtensionAttributeOuOriginal` | Nao | `msDS-cloudExtensionAttribute1` | Atributo AD onde a OU original e salva antes do move (`ExecutorSincronizadorAd.cs:37`) |
-
-!!! warning "Campos sem default abortam por excecao"
-    `OuDestino`, `DiasInatividade` e `MaximoAbertura` **nao** possuem default no codigo. `DiasInatividade` e `MaximoAbertura` sao lidos via `ToObject<int>()` — se ausentes, lançam excecao em runtime. Trate-os como obrigatorios.
-
-### `[ActiveDirectory][CaminhoConfigSincronizadorAd]`
-
-Caminho **relativo ao diretorio `CONFIG/` do SincronizadorAD**. O SincronizadorSAP usa esse caminho para ler os templates de quarentena que pertencem ao SincronizadorAD.
-
-!!! danger "Dependencia critica das acoes de quarentena"
-    As acoes `monitorar_quarentena` e `expirar_quarentena` do SAP dependem de `CaminhoConfigSincronizadorAd` apontar corretamente para o `CONFIG/` do SincronizadorAD. Se o caminho estiver incorreto, as acoes de quarentena nao localizam os templates de busca/abertura e o ciclo de quarentena quebra.
-
-### `[AzureAD][TempoEsperaEmHoras]`
-
-Define quanto tempo a acao `azure` (MFA) aguarda a sincronizacao do usuario no Azure AD antes de marcar a requisicao como insucesso. Quando a excecao `user could not be found` ocorre, compara-se o tempo decorrido desde a abertura da requisicao com esse valor (`ExecutorAzure.cs:146-167`). Exemplo: `400` horas.
-
-### Exemplo (`EXEMPLOS/RODAVEIS/config.json`)
+| Chave | Descrição | Valor |
+| --- | --- | --- |
+| `OuDestino` | OU base de quarentena (sob a qual são criadas as OUs mensais `5S-{MM-yyyy}`). | — |
+| `ExtensionAttributeOuOriginal` | Atributo que guarda a OU original antes do `MoveTo`. | `msDS-cloudExtensionAttribute1` (**confirmado**) |
+| `DiasParaExpiracao` | Dias em quarentena, sem login posterior, até abrir requisição de exclusão. | `30` (**default no código**) |
+| `DiasInatividade` | Dias sem login para enviar usuário à quarentena (main pass). | `90` (exemplo; **obrigatório** no SAP, sem fallback) |
+| `MaximoAbertura` | Máximo de aberturas de quarentena por execução. | `2` (exemplo; **obrigatório** no SAP) |
 
 ```json
 {
   "ActiveDirectory": {
     "Quarentena": {
-      "OuDestino": "OU=Quarentena,...",
+      "OuDestino": "OU=Quarentena,OU=Desligados,DC=herocorp,DC=com,DC=br",
+      "ExtensionAttributeOuOriginal": "msDS-cloudExtensionAttribute1",
+      "DiasParaExpiracao": 30,
       "DiasInatividade": 90,
-      "MaximoAbertura": 2,
-      "ExtensionAttributeOuOriginal": "msDS-cloudExtensionAttribute1"
+      "MaximoAbertura": 2
     }
   }
 }
 ```
 
----
+!!! note "Onde a OU original é gravada"
+    O `ExecutorQuarentena` extrai a OU original do `distinguishedName` (removendo o `CN=`) e a grava em `ExtensionAttributeOuOriginal` **antes** do `MoveTo` (pois o DN muda após a movimentação). O `ExecutorRetornarQuarentena` lê esse mesmo atributo para mover o usuário de volta, limpando o atributo e o campo `info` após o sucesso.
 
-## Templates JSON de acao (`CONFIG/{acao}/`)
+### 3.2 Bloco `AzureAD`
 
-Cada acao BDesk tem templates JSON sob `CONFIG/{acao}/`. Antes do envio ao BDesk, **tokens** dentro do template sao substituidos por valores reais.
+| Chave | Descrição | Valor |
+| --- | --- | --- |
+| `TempoEsperaEmHoras` | Janela máxima de espera para que o usuário apareça no Microsoft Graph antes de marcar insucesso. | exemplo `400` (a confirmar) |
 
-### Tokens suportados
+Enquanto a requisição Azure estiver dentro de `TempoEsperaEmHoras` e o usuário não for encontrado no Graph, a requisição é marcada como **Aguardando**; após o limite, é marcada como **insucesso**.
 
-| Token | Substituido por |
-|-------|-----------------|
-| `%VERSAO%` | Versao do binario (`Versao.Release`) |
-| `%LOGIN%` | Login (sAMAccountName) do usuario |
-| `%DISPLAY-NAME%` | Display name do usuario |
-| `%DETALHES%` | Detalhes da operacao |
-| `%DATA%` | Data |
-| `%PARTICIPANTE_POR_OU%` | Login do solicitante resolvido pela OU |
-| `%LISTA%` | Lista (multiplos itens) |
+### 3.3 `CaminhoConfigSincronizadorAd`
 
-Os tokens sao validados contra os campos do BDesk em `ExecutorSincronizador.cs:483`.
-
-### Exemplos disponiveis no repositorio
-
-- **SAP** (`SincronizadorSAP/EXEMPLOS/RODAVEIS/*.json`): `abrir-quarentena.json`, `retornar-quarentena.json`, `excluir-definitivo.json`.
-- **AD** (`SincronizadorAd/EXEMPLOS/CONFIG/`): **43 arquivos** cobrindo as 10 acoes — `inserir/`, `atualizar/`, `manutencao/`, `quarentena/`, `retornar_quarentena/`, `azure/`, `marcar_pendente/`, `marcar_pendente_cpf/`, `excluir/`, `excluir_cpf/`.
+Chave que aponta para o diretório de configuração e templates do SincronizadorAD, usada pelas ações de quarentena do SincronizadorSAP para carregar os templates JSON de busca/ação (via `LerJSONConfigDoSincronizadorAd()`).
 
 ---
 
-## `mapeamento-participantes.json`
+## 4. Templates por ação: `CONFIG/{acao}/*.json`
 
-Array de objetos `{ Login, OUs: [] }` que mapeia **OU -> login BDesk** do solicitante. O solicitante (participante "ANTE") e derivado da ultima OU do DN do usuario (split do DN por virgula, ignorando partes `DC=`, tomando o valor da ultima parte). Esse valor e usado como chave de lookup; se nao houver mapeamento, usa-se o fallback `Config["BDesk"]["Solicitante"]` (`ServicoSincronizadorSAP.cs:326-362`; carregamento em `ExecutorSincronizadorSAP.cs:1122-1153`).
+Cada ação tem um diretório `CONFIG/{acao}/` com dois tipos de template:
 
-!!! note "Retry por solicitante alternativo"
-    Quando o BDesk responde exatamente com `Participante 'ANTE' nao encontrado para o Login 'X'.`, o envio e retentado com um `LoginSolicitante` alternativo (`TentativasAPI` em `ExecutorSincronizadorSAP.cs:1057-1118`). A requisicao nao e descartada — apenas reprocessada com outro participante.
+| Template | Função |
+| --- | --- |
+| `busca-atividade-{acao}.json` | Detecção de duplicatas — busca requisições já abertas (status `Aberta` / `Em Andamento`) antes de abrir uma nova. |
+| `acao-sucesso-{acao}.json` | Fechamento da requisição e ações pós-sucesso. |
 
----
+### 4.1 Tokens de substituição
 
-## Listas negras e whitelist (texto)
+Os templates JSON usam tokens que são substituídos em tempo de execução pelos dados reais da requisição/usuário:
 
-Sao arquivos de texto puro, **1 entrada por linha**. Linhas vazias e comentarios iniciados por `#` ou `;` sao ignorados. Grupos AD sao normalizados para `CN=...,DC=...` em **minusculo**. Ficam em `../ConfigComum/` e em `CONFIG/`.
+| Token | Substituição |
+| --- | --- |
+| `%VERSAO%` | Versão do executável (de `Versao.cs`). |
+| `%LOGIN%` / `%LOGIN_ALTERADO%` | `sAMAccountName` do usuário. |
+| `%DISPLAY-NAME%` | Display name do usuário. |
+| `%DETALHES%` / `%ALTERACOES%` | Texto acumulado de alterações. |
+| `%DATA%` | Data corrente. |
+| `%PARTICIPANTE_POR_OU%` | Login solicitante mapeado pela OU (`mapeamento-participantes.json`, OU→login); fallback para o robô (login sem o 1º caractere). |
+| `%LISTA%` | Lista (ex.: grupos `MemberOf` na exclusão). |
 
-| Lista | Arquivos | Usado em | Evidencia |
-|-------|----------|----------|-----------|
-| **AD Sync** | `lista-negra-ad-grupos.txt`, `lista-negra-ad-logins.txt` | inserir / atualizar / excluir | `ExecutorAtualizacao.cs:23-24` |
-| **Quarentena** | `lista-negra-quarentena-grupos.txt`, `lista-negra-quarentena-logins.txt` | quarentena / monitor / expira / retorna | `ExecutorQuarentena.cs:23-24` |
-| **Ferias** | `lista-negra-ferias-grupos.txt`, `lista-negra-ferias-logins.txt` | SincronizadorFerias | `ExecutorSincronizadorFerias.cs:85-86` |
-| **Whitelist CPFs** | `usuarios-permitidos.txt` | SAP (se `ExecutarSomenteUsuariosDaListaDeUsuariosPermitidos=true`) | `ExecutorSincronizadorSAP.cs:159-161` |
-| **Blacklist CPFs** | `usuarios-proibidos.txt` | SAP | `ExecutorSincronizadorSAP.cs:169-171` |
-
-!!! note "Comportamento de listas de quarentena ausentes difere por contexto"
-    No **main pass** do SAP, a ausencia de uma lista de quarentena gera erro (`ExecutorSincronizadorSAP.LerListaExcecao`, linhas 1172-1203). Nas **acoes** de quarentena (`monitorar_quarentena` / `expirar_quarentena`), a ausencia e tratada silenciosamente, retornando lista vazia (`AcaoSincronizadorSAP.LerListaExcecao`, linhas 371-391) — intencional, para que as acoes rodem mesmo sem listas.
-
-!!! note "AD Sync: blacklist nao impede insercao"
-    As listas `lista-negra-ad-*` pulam **atualizacao e exclusao**, mas permitem **insercao**. O filtro so e aplicado quando `acao != "inserir"` (`ExecutorSincronizadorSAP.cs:939-955`).
-
----
-
-## Watermark do SincronizadorFerias
-
-Durante as ferias, o SincronizadorFerias grava um bloco marcador no atributo `streetAddress` (limite de **1020 caracteres**, truncado com `.Truncar(1020)`), no formato:
-
-```text
-{Ferias: DD/MM/YYYY - DD/MM/YYYY
-SincronizadorFerias {version}:CheckedOut:NAO REMOVER ESTE BLOCO!}
-{conteudo original do streetAddress}
-```
-
-O bloco marca que a automacao e "proprietaria" da alteracao. No retorno de ferias, o bloco e removido fazendo split pelo sentinela `:CheckedOut:NAO REMOVER ESTE BLOCO!}\n`, preservando o conteudo original (`ExecutorSincronizadorFerias.cs:262-293`).
-
-!!! danger "Nao remover o bloco manualmente"
-    Remover o bloco de marcacao a mao deixa a conta em estado bloqueado: o SincronizadorFerias deixa de reconhecer que o periodo de ferias foi aberto pela automacao e o fluxo de retorno (que zera `accountExpires` e remove o watermark) deixa de atuar corretamente. A remocao deve ser sempre feita pelo proprio sincronizador, no retorno de ferias.
+!!! note "Mapeamento de participante por OU"
+    O solicitante é derivado da **OU mais profunda** (último nível hierárquico, após filtrar cláusulas `DC=`) consultando `mapeamento-participantes.json`. Se a OU não estiver mapeada (caso típico das OUs de quarentena `5S-MM-yyyy`), usa-se o fallback configurado em `[BDesk] Solicitante` ou o login do robô sem o primeiro caractere.
 
 ---
 
-## Exemplos disponiveis no repositorio
+## 5. Listas (negras e brancas): `ConfigComum/`
 
-| Aplicacao | Caminho | Conteudo |
-|-----------|---------|----------|
-| SincronizadorSAP | `SincronizadorSAP/EXEMPLOS/SECRETOS/conf.ini` | `conf.ini` com credenciais placeholder |
-| SincronizadorSAP | `SincronizadorSAP/EXEMPLOS/RODAVEIS/*.json` | templates, `config.json`, `mapeamento-participantes.json` |
-| SincronizadorAD | `SincronizadorAd/EXEMPLOS/CONFIG/` | **43 arquivos**, todas as 10 acoes |
-| SincronizadorFerias | `SincronizadorFerias/EXEMPLOS/RODAVEIS/` | 6 templates + config |
-| SincronizadorGrupos | `SincronizadorGrupos/instrucoes-configuracao/EXEMPLOS/` | exemplos de `conf.ini` / config por OU |
+As listas controlam quem é processado por cada automação. São arquivos texto (um item por linha; linhas vazias e comentários `#`/`;` ignorados em alguns contextos).
 
-### Trechos do exemplo `EXEMPLOS/SECRETOS/conf.ini`
+| Arquivo | Escopo |
+| --- | --- |
+| `lista-negra-ad-grupos.txt` / `lista-negra-ad-logins.txt` | Exceções do SincronizadorAD (ações `atualizar`, `marcar_pendente*`, `excluir*`). |
+| `lista-negra-quarentena-grupos.txt` / `lista-negra-quarentena-logins.txt` | Exceções das ações de quarentena (`quarentena`, `retornar_quarentena`, e as ações SAP `monitorar_quarentena` / `expirar_quarentena`). |
+| `lista-negra-ferias-grupos.txt` / `lista-negra-ferias-logins.txt` | Exceções do SincronizadorFerias (aplicadas a L1). |
+| `usuarios-permitidos.txt` | **Whitelist** por CPF (SAP). |
+| `usuarios-proibidos.txt` | Blacklist por CPF (SAP). |
+
+!!! tip "Whitelist condicional"
+    A whitelist `usuarios-permitidos.txt` só fica **ativa** se `[BDesk] ExecutarSomenteUsuariosDaListaDeUsuariosPermitidos=true`.
+
+!!! note "Tolerância a arquivo ausente difere por contexto"
+    No **main pass** do SincronizadorSAP, uma lista de exceção ausente é tratada como **erro** (a execução retorna cedo). Já nas **ações de quarentena** SAP, a lista ausente gera apenas um **aviso** (`Trace.WriteLine`) e a operação continua com lista vazia — comportamento intencional para que a quarentena rode mesmo sem listas configuradas.
+
+---
+
+## 6. Diretórios de exemplos por projeto
+
+Cada projeto traz exemplos de configuração que servem de gabarito para o deploy:
+
+| Projeto | Diretório | Conteúdo |
+| --- | --- | --- |
+| **SincronizadorSAP** | `EXEMPLOS/RODAVEIS` | 9 arquivos de `CONFIG` (templates de quarentena, `config.json`, `mapeamento-participantes.json`). |
+| **SincronizadorSAP** | `EXEMPLOS/SECRETOS` | `conf.ini` de exemplo (54 linhas) com credenciais cifradas. |
+| **SincronizadorAD** | `EXEMPLOS/CONFIG` | 43 arquivos cobrindo as 10 ações roteadas por `-acao`. |
+| **SincronizadorFerias** | `EXEMPLOS/RODAVEIS` | 6 templates BDesk. |
+| **SincronizadorGrupos** | `instrucoes-configuracao/EXEMPLOS` | 3 arquivos (`conf.ini`, `abertura.json`, `encerramento.json`). |
+
+### Exemplo de `conf.ini` — SincronizadorGrupos
+
+O `conf.ini` de exemplo do SincronizadorGrupos (`instrucoes-configuracao/EXEMPLOS/conf.ini`) ilustra as três seções obrigatórias:
 
 ```ini
-[SAP]
-URL=http://sapaguiabranca
-; Login/Senha criptografadas (XOR)
+[Geral]
+CaminhoDados = D:\gitlab\sincronizador-grupos\dados-ou-qualquer-nome-de-pasta
+CaminhoBackups = F:\em-outra-unidade\ou-mesmo-outra-maquina\backups-ou-qualquer-nome-de-pasta
+MaximoAlteracoesPorExecucao = 10
 
 [ActiveDirectory]
-Servidor=127.1.1.1
-CampoCPF=l            ; exemplo
+Servidor = 127.1.1.1
+Caminho = DC=herocorp,DC=com,DC=br
+CaminhoGrupos = CN=Users
+Login = 17210
+Senha = 17210
 
 [BDesk]
-URL=https://askrest
-Formulario=68
-AtividadeInserir=12144
-AtividadeAtualizar=12871
-AtividadeExcluir=12861
-Criticidade=2571      ; Normal (ativo)
-
-; limites de lote = 0 (sem limite)
-DiasDeEsperaPorExclusoes=14   ; sobrescreve default 7
+URL = https://askrest
+Executar = true
+Token = 172101721017210172101721017210172101721017210
 ```
 
----
-
-## Discrepancias
-
-!!! warning "IDs de Atividades BDesk divergentes entre documentos"
-    Tres fontes apresentam valores diferentes para os IDs de criticidade/atividade:
-
-    | Fonte | Emergencial | Alta | Normal | Observacao |
-    |-------|-------------|------|--------|------------|
-    | `configuracao-servidores.md` §10 | 2573 | 2572 | 2571 | placeholders de exemplo |
-    | `instrucoes.txt:88-91` | 2350 | 2351 | 2349 | valores **historicos**, desatualizados |
-    | `EXEMPLOS/SECRETOS/conf.ini` | (2573 comentado) | (2572 comentado) | **2571 ativo** | exemplo |
-
-    Todos esses sao **valores de exemplo**. Os IDs reais de producao devem ser confirmados diretamente no `conf.ini` implantado nos servidores antes de qualquer ajuste.
+!!! warning "Nunca commitar credenciais reais"
+    Os valores acima são **placeholders** de exemplo. Em produção, `Login`, `Senha` e `Token` devem ser cifrados com `-criptografar` e os arquivos `conf.ini` reais devem ficar fora do controle de versão, com permissões restritas no servidor de deploy.
 
 ---
 
-## A confirmar
+## Resumo do fluxo de configuração
 
-Itens que dependem de validacao contra os hosts de producao:
-
-- **Variavel de ambiente `%BUSINESS_DESK%`**: como e onde e configurada nos servidores.
-- **Caminho real de `funcionalidades.txt`**: derivado de `Path.Combine(%BUSINESS_DESK%, "funcionalidades.txt")` em `GerenciadorVersao.cs:14`, mas o local fisico nos hosts ainda nao foi validado.
+1. **`conf.ini`** define infraestrutura, limites e credenciais cifradas (validadas por `CamposObrigatoriosIni`).
+2. **XOR** (chaves `109` / `191` / `161`) protege `Login`/`Senha`/`Token`; gere com `-criptografar`.
+3. **`config.json`** parametriza quarentena (`OuDestino`, `ExtensionAttributeOuOriginal`, `DiasParaExpiracao`, `DiasInatividade`, `MaximoAbertura`) e Azure (`TempoEsperaEmHoras`).
+4. **Templates `CONFIG/{acao}/*.json`** modelam busca de duplicatas e ações de sucesso, usando tokens de substituição.
+5. **Listas em `ConfigComum/`** controlam exceções e whitelist por login, grupo ou CPF.

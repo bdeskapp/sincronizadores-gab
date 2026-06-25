@@ -1,203 +1,126 @@
 # Servidores e Credenciais
 
-Esta página documenta os servidores de produção da suíte **Sincronizadores GAB** e o
-modelo de credenciais usado pelas quatro aplicações console .NET 8.0
-(SincronizadorAD, SincronizadorSAP, SincronizadorFerias e SincronizadorGrupos).
+Esta página descreve a infraestrutura de produção dos Sincronizadores GAB: os servidores onde a suíte está instalada, os caminhos de deploy, os requisitos de sistema operacional e runtime, as dependências técnicas, os endpoints externos consumidos, a conta de serviço necessária e o modelo de credenciais criptografadas.
 
-!!! info "Referências cruzadas"
-    - Para o processo de compilação e os artefatos gerados, consulte a página **Deploy e Build**.
-    - Para o detalhamento de `conf.ini`, `config.json`, templates e listas negras, consulte a página **Configuração**.
+!!! info "Origem dos fatos"
+    Os dados de servidor e caminho de deploy desta página foram confirmados em `src/SincronizadorSAP/instrucoes-configuracao/instrucoes.txt`. Itens marcados como **(a confirmar)** não estão evidenciados em código nem em `instrucoes.txt` e exigem validação com a equipe de operação.
 
 ## Servidores de produção
 
-A suíte é executada via **Windows Task Scheduler** (não há hospedagem em IIS).
-A instalação acompanha a estrutura do sistema BDesk e está replicada em dois
-servidores.
+A suíte está instalada em dois servidores Windows, ambos confirmados em `instrucoes.txt`:
 
-| Servidor | Papel | Evidência |
-|----------|-------|-----------|
-| **GAB13013i** | Servidor **ativo** — o serviço é executado **a partir** dele | `instrucoes.txt:2,6` + `CLAUDE.md` |
-| **GAB13011i** | Servidor **standby** | `instrucoes.txt:2,6` |
+| Host | Papel | Evidência |
+| --- | --- | --- |
+| `GAB13013i` | **Ativo** — o serviço é executado a partir deste host | `instrucoes.txt:6` ("Por se tratar de um serviço, o sincronizador será executado a partir do servidor GAB13013i") |
+| `GAB13011i` | **Standby** — instalação espelhada, não executa o serviço por padrão | `instrucoes.txt:2,6` |
 
-!!! warning "Toda alteração deve ser aplicada em AMBOS os servidores"
-    Embora o serviço seja executado **a partir de GAB13013i**, qualquer alteração
-    de configuração, binários ou templates **deve ser replicada manualmente nos
-    dois servidores** (GAB13013i **e** GAB13011i), conforme `instrucoes.txt:6`:
+O texto de `instrucoes.txt:2` confirma: *"o sincronizador está instalado nos servidores GAB13011i e GAB13013i e, em ambos servidores o caminho para a instalação é `F:\BusinessDesk\ASK\SincronizadorSAP\`"*.
 
-    > "Por se tratar de um serviço, o sincronizador será executado a partir do
-    > servidor GAB13013i, porém, as alterações devem ser aplicadas nos dois
-    > servidores onde o sincronizador está configurado (GAB13013i e GAB13011i)."
+!!! warning "Não há failover automático e ambos os servidores devem ser mantidos consistentes"
+    Não existe nenhum mecanismo de failover automático evidenciado no código — `instrucoes.txt` apenas **menciona** os dois hosts. O `GAB13013i` é o host ativo (executa o serviço via Task Scheduler) e o `GAB13011i` é mantido como standby por instalação espelhada, sem promoção automática.
 
-!!! danger "Sem lock/failover automatizado"
-    **Não há mecanismo de lock ou failover automatizado evidenciado** entre
-    GAB13013i e GAB13011i. A consistência entre os dois servidores depende de
-    procedimento operacional manual; não existe sincronização automática de
-    binários nem eleição de servidor ativo.
+    Por isso, conforme `instrucoes.txt:6`, **toda alteração de configuração deve ser aplicada em AMBOS os servidores** ("as alterações devem ser aplicadas nos dois servidores onde o sincronizador está configurado (GAB13013i e GAB13011i)"). Aplicar uma mudança apenas no host ativo deixa o standby desatualizado e inconsistente, comprometendo a recuperação caso seja necessário operar a partir do `GAB13011i`.
 
 ## Caminhos de deploy
 
-O único caminho **confirmado em código/documentação** é o do SincronizadorSAP
-(`instrucoes.txt:2`):
+| Aplicação | Caminho de instalação | Status |
+| --- | --- | --- |
+| `SincronizadorSAP` | `F:\BusinessDesk\ASK\SincronizadorSAP\` | Confirmado (`instrucoes.txt:2`) |
+| `SincronizadorAD` | `F:\BusinessDesk\ASK\SincronizadorAD\` | **A confirmar** (análogo, não evidenciado) |
+| `SincronizadorFerias` | `F:\BusinessDesk\ASK\SincronizadorFerias\` | **A confirmar** (análogo, não evidenciado) |
+| `SincronizadorGrupos` | `F:\BusinessDesk\ASK\SincronizadorGrupos\` | **A confirmar** (análogo, não evidenciado) |
 
-```text
-F:\BusinessDesk\ASK\SincronizadorSAP\
-```
+!!! note "Estrutura de deploy"
+    Apenas o caminho do `SincronizadorSAP` está documentado em `instrucoes.txt`. A suíte acompanha a estrutura de instalação do BDesk (`instrucoes.txt:2`: *"Este sincronizador acompanha a estrutura de instalação do sistema Bdesk"*), o que sugere o padrão `F:\BusinessDesk\ASK\{NomeApp}\` para as demais aplicações, mas isso **não foi verificado em código nem em documento** — trate os caminhos de AD/Ferias/Grupos como "a confirmar".
 
-Para os demais aplicativos, o padrão **inferido** segue
-`F:\BusinessDesk\ASK\{ExeName}\`:
+## Requisitos de sistema operacional e runtime
 
-| Aplicativo | Caminho de deploy | Status |
-|------------|-------------------|--------|
-| SincronizadorSAP | `F:\BusinessDesk\ASK\SincronizadorSAP\` | Confirmado (`instrucoes.txt:2`) |
-| SincronizadorAD | `F:\BusinessDesk\ASK\SincronizadorAD\` | **A confirmar** (inferido) |
-| SincronizadorFerias | `F:\BusinessDesk\ASK\SincronizadorFerias\` | **A confirmar** (inferido) |
-| SincronizadorGrupos | `F:\BusinessDesk\ASK\SincronizadorGrupos\` | **A confirmar** (inferido) |
+| Requisito | Valor | Motivo |
+| --- | --- | --- |
+| Sistema operacional | **Windows obrigatório** (x64/x86) | Uso de **ADODB COM** e **System.DirectoryServices**, que são específicos de Windows |
+| Runtime | **.NET 8.0** (`net8.0-windows8.0`) | Todas as 4 aplicações console têm como alvo este runtime |
 
-## Runtime obrigatório
+!!! warning "Windows é obrigatório — não há suporte a Linux/WSL em produção"
+    As aplicações dependem de interoperabilidade COM (ADODB) e de `System.DirectoryServices`, que só funcionam em Windows. `SincronizadorSAP` e `SincronizadorFerias` declaram `COMReference` para ADODB (`EmbedInteropTypes=true`), o que faz o build falhar em Linux/WSL. A execução em produção deve ocorrer exclusivamente em Windows.
 
-O runtime de produção é **.NET 8.0 para Windows (x64/x86)**. As dependências de
-COM interop e `System.DirectoryServices` tornam a execução **Windows-only**.
+## Dependências técnicas
 
-| Componente | TargetFramework | Observação |
-|------------|-----------------|------------|
-| SincronizadorAD / SincronizadorSAP / SincronizadorFerias / SincronizadorGrupos | `net8.0-windows8.0` | Sincronizadores de produção |
-| Atendame.Core | `net8.0` (puro) | Biblioteca portável (sem dependência Windows) |
-| SincronizadorAD.Simulador (legacy) | `.NET Framework 4.0` | **Não está em produção** |
+A tabela abaixo lista as dependências e seu papel em cada sincronizador.
 
-!!! note "Dependências nativas obrigatórias"
-    - **COM interop ADODB** é obrigatório para **SAP** e **Férias**
-      (`EmbedInteropTypes=true`). Builds em Linux/WSL falham com `MSB4803` — veja
-      a página **Deploy e Build**.
-    - **System.DirectoryServices 8.0.0** é usado por **AD**, **Férias** e **Grupos**.
+| Dependência | Versão | Papel |
+| --- | --- | --- |
+| `System.DirectoryServices` | (BCL) | Acesso LDAP/AD: criação, alteração, movimentação e exclusão de contas (`CommitChanges`, `MoveTo`) |
+| ADODB COM (`ADODB.Connection` + provider `ADSDSOObject`) | COM interop | Consultas e mutações via OLE DB ao SAP (SOAP), ao Ferias e ao Active Directory |
+| `System.DirectoryServices.DirectorySearcher` | (BCL) | Busca de usuários no AD em AD/Ferias/Grupos e nas ações de quarentena do SAP |
+| `Microsoft.Graph` | 5.75.0 | Ação `azure` do `SincronizadorAD` — configuração de MFA via Microsoft Graph |
+| `Microsoft.Identity.Client` (MSAL) | 4.70.0 | Autenticação de identidade para a integração Azure/MFA do `SincronizadorAD` |
+| `ini-parser` | 2.5.2 | Leitura do `conf.ini` (configuração por cliente) |
+| `HtmlAgilityPack` | 1.11.65 | Parsing do XML retornado pelo SAP |
 
-## Modelo de credenciais
+!!! tip "Onde cada dependência aparece"
+    - **ADODB COM** é usado para queries via `ADODB.Connection` com o provider `ADSDSOObject`, tanto para SAP/Ferias (SOAP) quanto para consultas ao AD.
+    - **Microsoft.Graph + MSAL** são exclusivos da ação `azure` do `SincronizadorAD` (ver `src/SincronizadorAd/Executores/ExecutorAzure.cs`).
 
-As credenciais sensíveis (logins e senhas de SAP, Metadados, Active Directory e
-BDesk) são **criptografadas com XOR usando chaves fixas no binário** e
-armazenadas no `conf.ini`. Elas são decriptadas em runtime, no momento da leitura
-da configuração.
+## Endpoints externos
 
-### Criptografia XOR com chaves fixas
+Os endpoints **não são fixos em código** — são configurados por cliente no `conf.ini`. Os valores abaixo são **placeholders de exemplo**, não os endereços reais de produção.
 
-As chaves estão fixas em código em
-`src/Cross-Cutting/Security/Cryptography.cs` (linhas 10-12):
+| Sistema | Protocolo | Placeholder de exemplo | Consumido por |
+| --- | --- | --- | --- |
+| SAP | SOAP (XML) | `http://sapaguiabranca` | SAP, Ferias |
+| Metadados | HTTP (XML) | `http://metadados` | AD, SAP, Ferias |
+| Metadados (Ferias) | SQL Server via OleDb | (servidor/banco no `conf.ini`) | Ferias |
+| BDesk | REST | `https://askrest` | Todas as aplicações |
+| Active Directory | LDAP / ADODB | `127.1.1.1` | Todas as aplicações |
+
+!!! note "Placeholders, não endereços reais"
+    Os valores `http://sapaguiabranca`, `http://metadados`, `https://askrest` e `127.1.1.1` são apenas exemplos ilustrativos. Os endereços reais são definidos nas seções correspondentes do `conf.ini` de cada servidor (`[SAP]`, `[Metadados]`, `[BDesk]`, `[ActiveDirectory]`). Consulte a página de **Configuração** para o detalhe dos campos.
+
+## Conta de serviço
+
+A conta sob a qual o serviço executa precisa de **acesso de leitura e escrita (R/W) ao Active Directory**.
+
+!!! warning "Permissão R/W no AD é obrigatória"
+    Operações como `CommitChanges` (gravação de atributos) e `MoveTo` (movimentação entre OUs, p.ex. na quarentena) exigem permissão de escrita no AD. Sem ela, ações de inserção, atualização, quarentena, retorno de quarentena e exclusão falham. Garanta que a conta de serviço configurada no Task Scheduler do `GAB13013i` (e do `GAB13011i`, caso entre em operação) tenha esses direitos.
+
+### Variável de ambiente `%BUSINESS_DESK%`
+
+A variável de ambiente `%BUSINESS_DESK%` define o caminho do arquivo `funcionalidades.txt`, que controla *feature flags* da suíte (lidas via `GerenciadorVersao` / `BooleanosVersao`).
+
+!!! note "Localização a confirmar"
+    A existência da variável `%BUSINESS_DESK%` e seu uso para localizar `funcionalidades.txt` (feature flags) estão referenciados, mas a **localização exata do arquivo é a confirmar**. Como a variável é parte do ambiente do processo, ela também precisa estar definida de forma idêntica em ambos os servidores.
+
+## Credenciais
+
+As credenciais sensíveis do `conf.ini` (logins e senhas de SAP, Metadados, AD e o token do BDesk) são armazenadas **criptografadas**.
+
+### Modelo de criptografia XOR
+
+A criptografia é um esquema XOR com chaves fixas embutidas no código, implementado em `Cryptography.Encrypt` / `Cryptography.Decrypt` em `src/Cross-Cutting/Security/Cryptography.cs`:
 
 | Constante | Valor |
-|-----------|-------|
-| `EncKey` | `161` |
+| --- | --- |
 | `EncC1` | `109` |
 | `EncC2` | `191` |
+| `EncKey` | `161` |
 
-!!! warning "Chaves embutidas no binário"
-    As chaves de criptografia são **constantes fixas no código**, não segredos
-    rotacionáveis. Os valores cifrados no `conf.ini` protegem contra leitura
-    casual, mas **não** constituem proteção criptográfica forte, pois qualquer
-    cópia dos binários permite a decriptação.
+!!! warning "Chaves fixas no código"
+    As chaves `109`, `191` e `161` são constantes estáticas no código-fonte (`Cryptography.cs`, linhas 10-12). Trata-se de ofuscação por XOR com chave fixa — adequada para impedir leitura casual do `conf.ini`, mas **não** equivalente a um cofre de segredos. Restrinja o acesso ao sistema de arquivos dos servidores e ao repositório de configuração.
 
-### Geração de valor criptografado (CLI)
+### Geração de valor criptografado
 
-Para gerar o valor cifrado de um login ou senha, executa-se o próprio
-sincronizador em modo utilitário; a saída é escrita em **stdout** e deve ser
-copiada para o campo correspondente do `conf.ini` (`instrucoes.txt:57`):
+Para gerar um valor criptografado, execute o próprio executável com o parâmetro `-criptografar` e copie o resultado impresso em `stdout` para o `conf.ini`:
 
-```bash
+```bat
 SincronizadorSAP.exe -criptografar valor-a-criptografar
 ```
 
-O modo `-criptografar` está disponível em todas as aplicações da suíte.
+Conforme `instrucoes.txt:57`: *"O valor criptografado será escrito na tela e deve ser copiado no arquivo conf.ini na linha onde for necessário."* O mesmo padrão (`<exe> -criptografar <valor>`) vale para os demais executáveis da suíte.
 
-## Campos obrigatórios do `conf.ini`
+!!! tip "Detalhe dos campos criptografados"
+    Quais campos do `conf.ini` precisam estar criptografados (logins, senhas, token BDesk) e como preencher cada seção é descrito na página de **Configuração**.
 
-O `conf.ini` é dividido em seções por sistema integrado. A validação ocorre na
-inicialização (via `CamposObrigatoriosIni`): se um campo obrigatório estiver
-ausente, o aplicativo aborta. Os campos **Login** e **Senha** são sempre
-armazenados **criptografados** (XOR) e decriptados em runtime.
+## Discrepâncias
 
-### `[ActiveDirectory]`
-
-| Campo | Descrição |
-|-------|-----------|
-| `Servidor` | Endereço/IP do servidor Active Directory |
-| `Caminho` | Caminho base LDAP de busca |
-| `Login` | Login de acesso ao AD (**criptografado**) |
-| `Senha` | Senha de acesso ao AD (**criptografada**) |
-| `CampoCPF` | Atributo do AD que armazena o CPF |
-| `DiasDeEsperaPorExclusoes` | Janela de espera (apenas **AD/SAP**); default 7 |
-
-### `[SAP]`
-
-| Campo | Descrição |
-|-------|-----------|
-| `URL` | Endpoint do sistema SAP (SOAP/HTTP) |
-| `Login` | Login de acesso (**criptografado**) |
-| `Senha` | Senha de acesso (**criptografada**) |
-
-### `[Metadados]`
-
-| Campo | Descrição |
-|-------|-----------|
-| `URL` | Endpoint do sistema Metadados |
-| `Login` | Login de acesso (**criptografado**) |
-| `Senha` | Senha de acesso (**criptografada**) |
-| `DeveProcessar` | `true`/`false` — indica se os dados de Metadados devem ser processados |
-
-!!! note "Metadados: HTTP/XML no SAP, SQL/OleDb no Férias"
-    No **SincronizadorSAP**, Metadados é consumido via **HTTP/XML**. No
-    **SincronizadorFerias**, além do HTTP, há acesso via **SQL/OleDb** configurado
-    na seção adicional `[BancoDeDadosMetadados]`, usado para injetar as datas de
-    férias.
-
-### `[BDesk]`
-
-| Campo | Descrição |
-|-------|-----------|
-| `URL` | Endpoint da API REST do BDesk |
-| `Token` | Token de acesso à API REST do BDesk |
-
-!!! info "Campos adicionais de `[BDesk]` no SincronizadorSAP"
-    O **SincronizadorSAP** exige, além de `URL` e `Token`, campos específicos de
-    abertura de requisição (`instrucoes.txt:77-99`):
-
-    - **Activity IDs:** `Formulario` (suportado: 68), `AtividadeInserir`,
-      `AtividadeAtualizar`, `AtividadeExcluir`.
-    - **Criticidade** e **limites de lote:** `Criticidade`,
-      `QuantidadeMaximaDeInsercoes`, `QuantidadeMaximaDeAtualizacoes`,
-      `QuantidadeMaximaDeExclusoes`.
-    - **Origem/solicitante:** `Solicitante` (participante solicitante padrão),
-      `DescricaoOrigem`, `TelefoneContato`.
-    - **Filtro:** `ExecutarSomenteUsuariosDaListaDeUsuariosPermitidos`.
-
-## A confirmar
-
-Os itens abaixo aparecem apenas como **placeholders** nos exemplos ou não foram
-evidenciados em código; precisam ser confirmados contra o ambiente real de
-produção.
-
-!!! warning "Itens pendentes de confirmação contra produção"
-    **Servidores e paths**
-
-    - Servidores e caminhos de deploy de **SincronizadorAD**, **SincronizadorFerias**
-      e **SincronizadorGrupos** (assume-se o padrão `F:\BusinessDesk\ASK\{ExeName}\`).
-    - Mecanismo de lock/failover entre GAB13013i ↔ GAB13011i (nenhum automatizado
-      evidenciado).
-
-    **URLs/IPs reais (atualmente placeholders nos exemplos)**
-
-    - SAP: `http://sapaguiabranca`
-    - Metadados: `http://metadados`
-    - BDesk: `https://askrest`
-    - Active Directory: `127.1.1.1`
-
-    **Outros placeholders**
-
-    - Domínio AD: `@universe.heroes`
-    - `GrupoInternet`: `CN=Web_Level 02 - BOT,OU=Proxy,OU=Groups,OU=GERAIS`
-    - Variável de ambiente `%BUSINESS_DESK%` e a localização real de
-      `funcionalidades.txt` (origem das feature flags / `BooleanosVersao`).
-
-!!! note "Atenção aos IDs de Activity/Criticidade no SAP"
-    O arquivo `instrucoes.txt:88-91` documenta valores **históricos** de
-    criticidade (Emergencial `2350`, Alta `2351`, Normal `2349`), enquanto os
-    exemplos atuais (`EXEMPLOS/SECRETOS/conf.ini`) usam `2573`/`2572`/`2571`.
-    Confirme os IDs vigentes antes de configurar o ambiente de produção — veja a
-    página **Configuração** para o detalhamento.
+!!! warning "Configuração é por cliente — não há servidor AD padrão na infraestrutura"
+    **Discrepância confirmada:** a configuração é **por cliente**, definida no `conf.ini` de cada instalação. **Não existe um servidor AD padrão (infra-wide)**: o campo `Config[ActiveDirectory][Servidor]` é **sempre obrigatório** e precisa ser informado explicitamente em cada `conf.ini`. Conforme `instrucoes.txt:72`, o campo `Servidor` da seção `[ActiveDirectory]` recebe o endereço IP do servidor Active Directory, sem valor padrão herdado da infraestrutura.

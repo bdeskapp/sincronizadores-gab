@@ -1,239 +1,277 @@
 # Regras do Sincronizador AD
 
-O **SincronizadorAD** é uma aplicação console **.NET 8.0** (Windows-only, com dependências de `System.DirectoryServices` e COM interop ADODB) que aplica **mutações no Active Directory** a partir de requisições abertas no BDesk. Ele lê as requisições via API REST do BDesk, executa a operação correspondente no AD e devolve o resultado (sucesso, insucesso ou aguardando) para a requisição.
+O **SincronizadorAD** é uma aplicação console em C# (.NET 8.0) que processa
+requisições abertas no BDesk e executa as mutações correspondentes no
+**Active Directory**. Cada execução é roteada por um parâmetro `-acao`, que
+determina qual operação será aplicada às contas: criação, atualização,
+manutenção, quarentena, retorno de quarentena, exclusão (por login ou CPF),
+marcação como pendente de exclusão e provisionamento de MFA no Azure.
 
-Toda a operação é roteada por linha de comando através do parâmetro **`-acao`**, que mapeia o nome da ação para uma classe executora concreta. A definição do roteamento está em `Program.cs` (método `Validar()`).
+Ao final de cada ação, o resultado (sucesso, insucesso ou aguardando) é
+postado de volta na requisição via API REST do BDesk.
 
-```bash
-SincronizadorAD.exe -executar -acao inserir    # modo escrita (CommitChanges no AD + POST no BDesk)
-SincronizadorAD.exe -consultar -acao inserir   # dry-run (sem mutações no AD nem na API)
-```
+!!! info "Onde está o código"
+    Os executores ficam em `src/SincronizadorAd/Executores/`. O roteamento
+    por `-acao` e o fluxo comum (busca do usuário, verificação de listas de
+    exceção e aplicação das alterações) estão em
+    `src/SincronizadorAd/ExecutorSincronizadorAd.cs`.
 
-!!! info "Dez ações, um tronco comum"
-    As **10 ações** abaixo herdam todas de `ExecutorAuxiliarBase` (`src/SincronizadorAd/Executores/ExecutorAuxiliarBase.cs`), que concentra a infraestrutura compartilhada: carga de templates JSON, leitura de listas de exceção, busca no AD (`ObterUnicoUsuarioAD`) e seleção de solicitante por OU.
+## As 10 ações
 
-## As 10 ações roteadas por `-acao`
+Todas as ações são implementadas por executores que herdam de
+`ExecutorAuxiliarBase` (`src/SincronizadorAd/Executores/ExecutorAuxiliarBase.cs`).
 
-| `-acao` | Classe executora | O que faz |
+| `-acao` | Executor | Arquivo | O que faz |
+|---|---|---|---|
+| `inserir` | `ExecutorInsercao` | `ExecutorInsercao.cs` | Cria a conta, gera o login em até 8 tentativas, define senha temporária e dispara 8 desdobramentos automáticos. |
+| `atualizar` | `ExecutorAtualizacao` | `ExecutorAtualizacao.cs` | Atualiza Cargo, Departamento e Centro de Custo usando o CPF como chave. |
+| `manutencao` | `ExecutorManutencao` | `ExecutorManutencao.cs` | Gera senha aleatória, reativa a conta desabilitada e posta a ação na requisição de exclusão correspondente. |
+| `quarentena` | `ExecutorQuarentena` | `ExecutorQuarentena.cs` | Move o usuário para a OU mensal de quarentena e desabilita a conta. |
+| `retornar_quarentena` | `ExecutorRetornarQuarentena` | `ExecutorRetornarQuarentena.cs` | Move o usuário de volta para a OU original (sem reativar a conta). |
+| `excluir` | `ExecutorExclusaoPorLogin` | `ExecutorExclusaoPorLogin.cs` | Exclui a conta por login, com verificação de recontratação. |
+| `excluir_cpf` | `ExecutorExclusaoPorCPF` | `ExecutorExclusaoPorCPF.cs` | Exclui a conta por CPF, sem verificação de recontratação. |
+| `marcar_pendente` | `ExecutorMarcarPendenteExclusaoPorLogin` | `ExecutorMarcarPendenteExclusao.cs` | Desabilita a conta localizada por login. |
+| `marcar_pendente_cpf` | `ExecutorMarcarPendenteExclusaoPorCPF` | `ExecutorMarcarPendenteExclusao.cs` | Desabilita a conta localizada por CPF. |
+| `azure` | `ExecutorAzure` | `ExecutorAzure.cs` | Provisiona MFA/dados via Microsoft Graph, sem busca no AD. |
+
+!!! note "Quarentena e retorno de quarentena"
+    As ações `quarentena` e `retornar_quarentena` fazem parte de um fluxo
+    cross-project (SAP + AD). As regras detalhadas desse ciclo — OU mensal,
+    metadados gravados, retorno e expiração — estão na página
+    [Ciclo de Vida da Quarentena](ciclo-vida-quarentena.md). Aqui descrevemos
+    apenas o que o SincronizadorAD executa por requisição.
+
+---
+
+## Inserção (`ExecutorInsercao`)
+
+A inserção é a ação mais complexa: cria a conta no AD, calcula o login,
+define a senha temporária, aplica regras específicas de prestador de serviço
+e dispara desdobramentos automáticos para os demais sistemas.
+
+### Geração de login em 8 tentativas
+
+A partir do nome do usuário, o código extrai `primeiro`, `segundo`, `terceiro`
+e `ultimo` (último nome) e constrói uma lista ordenada de até 8 candidatos a
+login (`ExecutorInsercao.cs`, linhas 132-188). Cada candidato é testado em
+sequência; o primeiro que **não** cair em palavra pejorativa e **não** já
+existir no AD é adotado.
+
+| # | Composição do login | Exemplo (João Carlos Silva Souza) |
 |---|---|---|
-| `inserir` | `ExecutorInsercao` | Cria usuário no AD, gera login, define senha temporária e dispara desdobramentos |
-| `atualizar` | `ExecutorAtualizacao` | Atualiza cargo/departamento/centro de custo por CPF |
-| `manutencao` | `ExecutorManutencao` | Redefine senha, reativa conta, aplica cap de 90 dias |
-| `quarentena` | `ExecutorQuarentena` | Move usuário para OU mensal de quarentena e desabilita a conta |
-| `retornar_quarentena` | `ExecutorRetornarQuarentena` | Retorna o usuário à OU original a partir do extensionAttribute |
-| `azure` | `ExecutorAzure` | Registra telefone de MFA via Microsoft Graph |
-| `marcar_pendente` | `ExecutorMarcarPendenteExclusaoPorLogin` | Desabilita conta por login |
-| `marcar_pendente_cpf` | `ExecutorMarcarPendenteExclusaoPorCPF` | Desabilita conta por CPF |
-| `excluir` | `ExecutorExclusaoPorLogin` | Exclui conta por login (com verificação de recontratação) |
-| `excluir_cpf` | `ExecutorExclusaoPorCPF` | Exclui conta por CPF (sem verificação de recontratação) |
+| 1 | `primeiro` | `joao` |
+| 2 | `primeiro` + inicial do `segundo` | `joaoc` |
+| 3 | `primeiro` + iniciais do `segundo` e `terceiro` | `joaocs` |
+| 4 | `primeiro` + inicial do `terceiro` | `joaos` |
+| 5 | `primeiro` + inicial do `segundo` + `ultimo` (sobrenome) | `joaocsouza` |
+| 6 | `primeiro` + `segundo` | `joaocarlos` |
+| 7 | `primeiro` + `terceiro` | `joaosilva` |
+| 8 | `primeiro` + `segundo` + `terceiro` | `joaocarlossilva` |
 
-O fluxo de cada requisição, orquestrado por `ExecutorSincronizadorAD`, segue o padrão: buscar detalhes → `ObterUnicoUsuarioAD()` → `VerificaListasExcecao()` → `AlterarAD()` → postar a ação no BDesk.
+!!! note "Tentativas condicionais"
+    As tentativas que dependem do segundo ou terceiro nome só são geradas se
+    esses nomes existirem. Para um usuário com apenas dois nomes, por exemplo,
+    a lista é mais curta. A primeira tentativa (`primeiro`) está sempre
+    presente.
 
----
+### Prefixo `ps.` para prestador de serviço
 
-## Inserção — `ExecutorInsercao`
+Quando o campo `1.11 Prestador de Serviço?` da requisição é `True`, o prefixo
+`ps.` é prependado a **todas** as 8 tentativas de login (linhas 122-188). Não
+há remoção ou alteração condicional do prefixo após sua atribuição inicial.
 
-A ação de inserção (`src/SincronizadorAd/Executores/ExecutorInsercao.cs`) é a mais complexa: cria o usuário no AD, gera o login, define a senha temporária e, ao final, dispara as sub-requisições de provisionamento de acesso.
+```text
+prefixo = (ps == "True") ? "ps." : ""
+login   = prefixo + ...
+```
 
-### (a) Rejeição por CPF duplicado — antes de gerar o login
+### Filtro de palavras pejorativas
 
-Antes de qualquer tentativa de geração de login, a inserção verifica se já existe alguma conta no AD com o mesmo CPF.
+Antes de aceitar um candidato, o login é normalizado removendo o prefixo
+`ps.` (`Split('.').Last()`) e comparado, de forma **case-insensitive**
+(`StringComparison.OrdinalIgnoreCase`), contra a lista de palavras pejorativas
+(linhas 196-203). Se houver correspondência, o candidato é descartado
+(`continue`) e a próxima tentativa é avaliada.
 
-!!! warning "Bloqueio por CPF duplicado"
-    Nas **linhas 74-88**, o executor consulta o AD via `ObterUsuarioAD(itemHistorico, ExecutorPrincipal.CampoCPF, cpf, ...)`. Se qualquer usuário for encontrado (`usuarioscpf.Any()`), a inserção é **rejeitada**: `itemHistorico.Insucesso = true` e o método retorna imediatamente.
+A lista é carregada em `LerJSONsProprios()` a partir do arquivo
+`mapeamento-palavras.txt` em `CONFIG/`.
 
-    A mensagem de insucesso **lista todos os `sAMAccountName`** que compartilham aquele CPF (linhas 82-85), facilitando o diagnóstico. Como essa verificação ocorre **antes** da geração do login, nenhuma conta nova é criada se o CPF já estiver cadastrado.
+### Senha temporária determinística
 
-### (b) Prefixo `ps.` automático para Prestador de Serviço
+A senha inicial segue o padrão determinístico
+`@{PrimeiraLetra}{ddMMyyyy}` (linhas 250-256):
 
-Quando o campo **`1.11 Prestador de Serviço?`** da requisição é igual a `True`, todos os logins gerados recebem o prefixo `ps.`.
+- `PrimeiraLetra` = primeira letra do nome, em maiúscula;
+- `ddMMyyyy` = data de execução.
+
+!!! example "Exemplo"
+    Usuário **João** processado em **25/06/2025** recebe a senha
+    `@J25062025`. Como depende da data do sistema no momento da execução, a
+    senha é previsível para a data corrente.
+
+### Cap de 90 dias para prestador de serviço
+
+Para prestadores de serviço (`ps == "True"`), o campo `accountExpires`
+(FILETIME) é limitado a **90 dias** a partir da data de abertura da requisição
+(linhas 390-423). Se a data de expiração solicitada exceder esse máximo,
+prevalece o cap:
 
 ```csharp
-// ExecutorInsercao.cs, linhas 122-130 (resumo)
-var prefixo = ps == "True" ? "ps." : "";
+dataExpiracaoMaxima = dataAbertura.Value.AddDays(90);
+if (dataExpiracaoSolicitada.Value > dataExpiracaoMaxima)
+    dataExpiracao = dataExpiracaoMaxima;
 ```
 
-O `prefixo` é concatenado em **todas as 8 tentativas** de geração de login (linhas 132-188), garantindo que qualquer login de prestador comece com `ps.`.
+### Desdobramentos automáticos
 
-### (c) Algoritmo de geração de login — 8 tentativas exatas
+A inserção dispara **8 sub-requisições de desdobramento**, uma por sistema,
+carregadas de templates `desdobrar-inclusao-*.json` (linhas 38-45) e
+executadas em sequência ao final de `AlterarAD()` (linhas 545-1024):
 
-O login é gerado por uma sequência de **8 padrões testados nesta ordem exata** (linhas 132-188). A primeira candidata que passar nas duas validações é adotada.
+| Desdobramento | Template |
+|---|---|
+| SAP | `desdobrar-inclusao-sap.json` |
+| Sistemas | `desdobrar-inclusao-sistemas.json` |
+| Rede | `desdobrar-inclusao-rede.json` |
+| Internet | `desdobrar-inclusao-internet.json` |
+| Email | `desdobrar-inclusao-email.json` |
+| VPN | `desdobrar-inclusao-vpn.json` |
+| Telefonia | `desdobrar-inclusao-telefonia.json` |
+| Azure | `desdobrar-inclusao-azure.json` |
 
-| # | Padrão | Composição |
-|---|---|---|
-| 1 | `primeiro` | primeiro nome completo |
-| 2 | `primeiroI2` | primeiro nome + inicial do segundo nome |
-| 3 | `primeiroI2I3` | primeiro nome + iniciais do segundo e terceiro nomes |
-| 4 | `primeiroI3` | primeiro nome + inicial do terceiro nome |
-| 5 | `primeiroI2sobrenome` | primeiro nome + inicial do segundo nome + sobrenome (último nome) |
-| 6 | `primeirosegundo` | primeiro e segundo nomes completos |
-| 7 | `primeiroterceiro` | primeiro e terceiro nomes completos |
-| 8 | `primeirosegundoterceiro` | os três nomes completos |
+!!! tip "Internet e VPN são processadas internamente"
+    Além de abrir a sub-requisição, **Internet** e **VPN** são tratadas dentro
+    do próprio SincronizadorAD: o usuário é adicionado ao `GrupoInternet`
+    (linhas 735-795) e ao `GrupoVPN` (linhas 835-934) via
+    `DirectoryEntry.Children.Find(...)` seguido de `groupEntry.Invoke("Add", ...)`.
+    A VPN é concedida **somente se o usuário não for prestador de serviço**.
 
-Cada candidato é validado por **dois filtros** dentro do loop `foreach` (linhas 193-233):
+---
 
-1. **Filtro de palavras pejorativas** (linhas 196-203) — case-insensitive. Antes da comparação, o prefixo `ps.` é removido do candidato via `Split('.').Last()` (ex.: `ps.joao` → `joao`); a comparação usa `StringComparison.OrdinalIgnoreCase` contra a lista carregada de `mapeamento-palavras.txt`. Se houver match, o candidato é descartado com `continue`.
-2. **Disponibilidade no AD** (linhas 208-219) — consulta `ExecutorPrincipal.Servico.ObterUsuarioAD()`; o candidato só é aceito (`break`, linha 228) quando `disponivel = !usuarios.Any()`.
+## Atualização (`ExecutorAtualizacao`)
 
-!!! note "Origem da lista de palavras pejorativas"
-    O arquivo `mapeamento-palavras.txt` é carregado em `CONFIG/` (linha 49), via `ExecutorPrincipal.LerArquivoTexto("mapeamento-palavras.txt")`.
+A atualização localiza a conta usando o **CPF como chave** (campo
+`1.2 - CPF` na seção `Dados do Cliente`) e modifica exatamente três campos no
+AD (`ExecutorAtualizacao.cs`, linhas 63-65, 84-86):
 
-### (d) Senha temporária determinística
+| Campo da requisição | Atributo AD |
+|---|---|
+| Cargo | `title` |
+| Departamento | `department` |
+| Centro de Custo | `postalCode` |
 
-A senha temporária de inserção segue um formato **determinístico**, gerado pela função local `GerarSenhaUsuario` (linhas 250-256):
+---
 
-```
-@{PrimeiraLetraDoNome}{ddMMyyyy}
-```
+## Manutenção (`ExecutorManutencao`)
 
-Por exemplo, um usuário cujo nome começa com "J", criado em 25/06/2025, recebe a senha **`@J25062025`**. A senha é aplicada ao AD via `userEntry.Invoke("SetPassword", new object[] { s })` (linha 462).
+A manutenção redefine o acesso de uma conta e reativa contas desabilitadas.
 
-!!! tip "Não confundir com a senha de manutenção"
-    Esta senha **determinística** `@{L}{ddMMyyyy}` é exclusiva da **inserção**. A ação `manutencao` usa uma senha **aleatória e criptograficamente segura** (descrita mais abaixo).
+- **Senha aleatória**: gera uma senha de no mínimo **8 caracteres**,
+  garantindo pelo menos 1 minúscula, 1 maiúscula, 1 número e 1 caractere
+  especial. A implementação está em
+  `ExecutorSincronizadorAd.GerarSenhaAleatoria` (linhas 422-480), usando
+  `RandomNumberGenerator` (criptograficamente seguro) e embaralhamento
+  Fisher-Yates.
+- **Reativação**: se a conta estiver desabilitada, o bit
+  `ADS_UF_ACCOUNTDISABLE` é **limpo** via operação bit a bit
+  (`old_UAC & ~ADS_UF_ACCOUNTDISABLE`).
+- **Cap de 90 dias**: a data de manutenção é limitada a 90 dias a partir da
+  data de abertura da requisição.
 
-### (e) Cap de validade de 90 dias para prestador
+!!! warning "A ação é postada na requisição de EXCLUSÃO"
+    A manutenção busca a requisição de exclusão correspondente ao usuário em
+    **4 consultas** (`marcar_pendente`, `marcar_pendente_cpf`, `excluir`,
+    `excluir_cpf`) e posta o resultado na **requisição de exclusão**, não na de
+    manutenção. O endpoint usa `reqExclusao.RequisicaoId`, não
+    `req.RequisicaoId` (`ExecutorManutencao.cs`).
 
-Para contas de **prestador de serviço** (quando `ps == "True"`, linha 390), a validade da conta é limitada a no máximo **90 dias a contar da data de abertura da requisição**.
+---
+
+## Exclusão (`ExecutorExclusao` → por login / por CPF)
+
+A exclusão envia a conta para a lixeira do AD, mas só após uma série de
+verificações de segurança.
+
+1. **Bloqueio por data**: se a data atual for anterior à `Data da exclusão
+   efetiva`, a requisição é marcada como **Aguardando** e o processamento
+   retorna (`PodeExcluir()`).
+2. **Conta deve estar desabilitada**: se o bit `ADS_UF_ACCOUNTDISABLE` não
+   estiver presente em `userAccountControl`, a ação falha
+   (`itemHistorico.Insucesso = true`).
+3. **Verificação de recontratação**: por CPF, o sistema consulta **Metadados
+   (HTTP)** e **SAP (SOAP)**. Se o usuário foi recontratado, a conta é
+   **reativada** (limpa `ADS_UF_ACCOUNTDISABLE`) e a ação retorna erro.
+4. **Envio para lixeira**: a conta é removida via
+   `userEntry.Parent.Children.Remove(userEntry)`, removendo recursivamente os
+   filhos primeiro (`EnviarParaLixeira()`).
+5. **Desdobramento**: abre uma sub-requisição com a lista de grupos
+   `MemberOf` do usuário (que, por característica do AD, **não inclui o grupo
+   primário**).
+
+!!! note "Exceções na verificação de recontratação"
+    - **`excluir_cpf`** (`ExecutorExclusaoPorCPF`) **desativa** a verificação de
+      recontratação: o método `VerificarRecontratacao()` retorna `false`
+      imediatamente via `if (this is ExecutorExclusaoPorCPF)`.
+    - Se o usuário **já está em quarentena** (o DN contém `OuQuarentena`), a
+      verificação de recontratação também é pulada e a exclusão prossegue.
+
+---
+
+## Marcar pendente de exclusão (`ExecutorMarcarPendenteExclusao`)
+
+As ações `marcar_pendente` (por login) e `marcar_pendente_cpf` (por CPF)
+**desabilitam** a conta, aplicando OR bit a bit com `ADS_UF_ACCOUNTDISABLE`:
 
 ```csharp
-// ExecutorInsercao.cs, linhas 393-418 (resumo)
-var dataExpiracaoMaxima = dataAbertura.AddDays(90);
-if (dataExpiracaoSolicitada > dataExpiracaoMaxima)
-    dataExpiracao = dataExpiracaoMaxima;   // o cap de 90 dias prevalece
+valorNovo = old_UAC | ActiveDirectory.ADS_UF_ACCOUNTDISABLE;
 ```
 
-Se a data de expiração solicitada exceder o limite, o cap de 90 dias prevalece.
-
-### (f) Desdobramentos disparados condicionalmente
-
-Ao final da inserção, o executor pode disparar até **8 sub-requisições de desdobramento** via `POST /v1/requisicoes/desdobrar`, para provisionar os acessos: **rede, internet, email, sap, sistemas, vpn, telefonia e azure**.
-
-!!! warning "Disparo condicional, não automático"
-    Embora o sistema **suporte os 8 desdobramentos em sequência**, eles **não são todos disparados automaticamente**. Cada desdobramento só é acionado quando há **solicitação explícita** do acesso correspondente no formulário BDesk.
-
-    Exemplo: o desdobramento de **SAP só é disparado** se o campo `Acesso Sistemas` > `2.1 - SAP` for igual a `True`. Os templates de cada desdobramento são carregados de `CONFIG/inserir/desdobrar-inclusao-*.json` (linhas 40-45).
+A alteração é persistida via `itemHistorico.SalvarEntry()`
+(`ExecutorMarcarPendenteExclusao.cs`, linhas 44-101).
 
 ---
 
-## Manutenção — `ExecutorManutencao`
+## Azure (`ExecutorAzure`)
 
-A ação `manutencao` (`src/SincronizadorAd/Executores/ExecutorManutencao.cs`) redefine senha, reativa contas desabilitadas e aplica um cap de validade — mas com uma particularidade importante quanto a **onde** a ação de resultado é postada.
+A ação `azure` provisiona dados/MFA no **Microsoft Graph** e tem um fluxo
+distinto das demais.
 
-### (a) Posta o resultado na requisição de EXCLUSÃO correspondente
-
-A manutenção carrega **4 templates JSON de busca** (linhas 34-39) para localizar a requisição de exclusão correlata ao usuário:
-
-- `marcar_pendente`
-- `marcar_pendente_cpf`
-- `excluir`
-- `excluir_cpf`
-
-O método `BuscarReqExclusao` (linhas 77-129) itera sobre as requisições de exclusão buscando a correspondência por login ou por CPF.
-
-!!! warning "A ação é postada na requisição de exclusão, não na de manutenção"
-    Na **linha 206**, o resultado (sucesso ou erro) é postado no endpoint da requisição de **exclusão** encontrada (`reqExclusao.RequisicaoId`), e **não** na requisição de manutenção (`req.RequisicaoId`).
-
-### (b) Senha aleatória criptograficamente segura
-
-Diferentemente da inserção, a manutenção gera uma **senha aleatória** via `ExecutorSincronizadorAD.GerarSenhaAleatoria(8)` (definida em `ExecutorSincronizadorAd.cs`, linhas 422-452; chamada em `ExecutorManutencao.cs:150`).
-
-A senha garante:
-
-- mínimo de **8 caracteres**;
-- pelo menos **1 letra minúscula**, **1 maiúscula**, **1 número** e **1 caractere especial** (posicionados em `password[0..3]`);
-- geração via `System.Security.Cryptography.RandomNumberGenerator.Create()` (criptograficamente seguro);
-- **embaralhamento Fisher-Yates** com `RandomNumberGenerator` (`ShuffleArray`), para que os caracteres garantidos não fiquem sempre nas mesmas posições.
-
-### (c) Cap de 90 dias na data final
-
-A data final de manutenção também é limitada a no máximo **90 dias a partir da data de abertura da requisição de manutenção** (linhas 155-160):
-
-```csharp
-if (dataManutencao > req.DataAbertura.AddDays(90))
-    dataManutencao = req.DataAbertura.AddDays(90);   // excesso é truncado
-```
+- **Sem busca no AD**: o executor não define
+  `ConjuntoDadoAdicionalContendoChave`, de modo que `ObterUnicoUsuarioAD()`
+  retorna sem efeito. A identidade vem diretamente dos campos da requisição —
+  o `UserPrincipalName` é extraído da seção `DADOS DO USUÁRIO AZURE`.
+- **Normalização de celular**: o número é limpo (remove tudo que não é
+  dígito); se não contiver `55` **e** tiver **11 dígitos ou menos**, o prefixo
+  `55` é prependado; por fim, adiciona-se `+`. O resultado típico é
+  `+55DDNNNNNNNN`; para números com mais de 11 dígitos, mantém-se
+  `+{numeroOriginal}`.
+- **Aguardando vs. insucesso**: se o usuário **não for encontrado no Graph** e
+  o tempo decorrido desde a abertura for **menor** que `TempoEsperaEmHoras`, a
+  requisição é marcada como **Aguardando** (será reprocessada). Após esse
+  limite, é marcada como **insucesso** (`ExecutorAzure.cs`, linhas 146-167).
 
 ---
 
-## Exclusão — `ExecutorExclusao`
+## Listas de exceção
 
-A exclusão é uma família de executores abstratos com duas variantes concretas: `ExecutorExclusaoPorLogin` (`excluir`) e `ExecutorExclusaoPorCPF` (`excluir_cpf`). O código está em `src/SincronizadorAd/Executores/ExecutorExclusao.cs`.
+As listas de exceção bloqueiam ações em logins ou grupos sensíveis. A
+verificação central está em `ExecutorSincronizadorAd.AlterarConta`, que chama
+`ExecutorAuxiliarBase.VerificaListasExcecao` **antes** de aplicar a mutação;
+se o login ou um grupo do usuário estiver em lista de exceção, a ação é
+bloqueada com `itemHistorico.Insucesso = true`. Grupos e logins são
+normalizados ao formato `CN=...,DC=...` em minúsculas.
 
-### (a) Só executa se a conta estiver inativa
+!!! warning "Nem todas as ações verificam listas de exceção"
+    | Ação | Verifica lista de exceção? | Lista usada |
+    |---|---|---|
+    | `atualizar` | Sim | Exceção AD (grupos + logins) |
+    | `marcar_pendente` / `marcar_pendente_cpf` | Sim | Exceção AD (grupos + logins) |
+    | `excluir` / `excluir_cpf` | Sim | Exceção AD (grupos + logins) |
+    | `quarentena` / `retornar_quarentena` | Sim | Exceção de **quarentena** |
+    | `inserir` | **Não** | — |
+    | `azure` | **Não** | — |
+    | `manutencao` | **Não** | — |
 
-A exclusão só prossegue se a conta já estiver **desabilitada** no AD.
-
-!!! danger "Guarda contra exclusão de conta ativa"
-    Nas **linhas 114-133**, o executor lê `userAccountControl` e faz a operação bitwise `AND` com `ADS_UF_ACCOUNTDISABLE` (`= 0x0002`, conforme `ActiveDirectory.cs:9`). Se a conta **não** estiver inativa, registra o erro *"O usuário não se encontra inativo, não será excluído"*, marca `itemHistorico.Insucesso = true` e retorna. Apenas após esse check é que `EnviarParaLixeira` é chamado (linha 143).
-
-### (b) `PodeExcluir()` — só após a data de exclusão efetiva
-
-O método `PodeExcluir()` (linhas 195-204) extrai o campo **`Data da exclusão efetiva`** da requisição e compara com `DateTime.Now`. A exclusão só procede quando a data atual **atinge ou ultrapassa** essa data (`>=`).
-
-Quando `PodeExcluir()` retorna `false` (linhas 107-111), a requisição é marcada como **Aguardando** e o processamento termina com `return` — a requisição é reprocessada em execuções futuras até a data limite ser atingida.
-
-### (c) Verificação de recontratação por CPF
-
-Para a exclusão **por login**, o executor verifica se o colaborador foi **recontratado**, consultando duas fontes por CPF, em ordem (método `VerificarRecontratacao`, linhas 290-320):
-
-1. **Metadados** (HTTP) — 1ª fonte consultada (linha 308);
-2. **SAP** (SOAP) — 2ª fonte consultada (linha 313).
-
-!!! danger "Recontratação reativa a conta e bloqueia a exclusão"
-    Se o usuário for identificado como recontratado, `ProcessarRecontratacao()` chama `AtualizarStatusConta()`, que **remove o flag `ADS_UF_ACCOUNTDISABLE`** (reativando a conta), marca `itemHistorico.Insucesso = true` e retorna — **bloqueando a exclusão** (a conta nunca chega a `EnviarParaLixeira()`).
-
-!!! warning "Risco operacional: falha silenciosa"
-    A verificação de recontratação via SAP/Metadados não possui tratamento de exceção visível. Se a consulta HTTP/SOAP falhar, o resultado é interpretado como "não recontratado", o que pode levar à **exclusão de uma conta de colaborador recontratado**. Este é um ponto de atenção operacional registrado.
-
-### (d) Exclusão por CPF não tem guarda-corpo de recontratação
-
-!!! danger "`ExecutorExclusaoPorCPF` ignora a verificação de recontratação"
-    A verificação de recontratação é **desabilitada** para `ExecutorExclusaoPorCPF` em dois pontos:
-
-    - **Linhas 44-48** (`LerJSONsProprios()`): `if (this is ExecutorExclusaoPorCPF) { ... return; }` — pula o carregamento de credenciais de SAP/Metadados.
-    - **Linhas 300-304** (`VerificarRecontratacao()`): `if (this is ExecutorExclusaoPorCPF) { ...; return false; }` — retorna sem consultar Metadados/SAP.
-
-    Portanto, a **exclusão por CPF não tem guarda-corpo de recontratação**. Apenas `ExecutorExclusaoPorLogin` passa pelas duas verificações.
-
-### (e) Usuário já em quarentena — exclusão segue sem verificar recontratação
-
-!!! note "Quarentena dispensa a verificação de recontratação"
-    Em `VerificarRecontratacao()` (linhas 290-298), se `JaEstaEmQuarentena()` retornar `true`, o método retorna `false` imediatamente, **pulando os checks de Metadados e SAP**. Isso vale para **ambas** as variantes — inclusive a exclusão **por login**. Ou seja, usuários que já estão em quarentena seguem o fluxo normal de exclusão **sem** ter a recontratação verificada.
-
----
-
-## Azure (MFA) — `ExecutorAzure`
-
-A ação `azure` (`src/SincronizadorAd/Executores/ExecutorAzure.cs`) registra o telefone de MFA no Azure AD via Microsoft Graph. Diferentemente das demais ações, **não realiza busca no Active Directory**.
-
-!!! info "Para detalhes completos, veja a página dedicada"
-    Esta seção cobre o essencial. O ciclo completo de MFA/Azure é tratado na página dedicada, quando disponível.
-
-Pontos principais:
-
-- **Não busca no AD:** `ConjuntoDadoAdicionalContendoChave` permanece `null`, de modo que `ObterUnicoUsuarioAD()` (em `ExecutorAuxiliarBase`) retorna cedo sem executar nenhuma busca no AD. `ChaveUsuarioAD()` retorna `"userPrincipalName"`, mas esse valor nunca é usado para busca.
-- **Identidade vem da requisição:** o `UserPrincipalName` e o número de celular são lidos diretamente dos campos da requisição BDesk (seção `DADOS DO USUÁRIO AZURE`).
-- **Espera por sincronização:** se o usuário ainda não foi encontrado no Azure AD, o executor calcula o tempo decorrido desde a abertura da requisição. Enquanto for menor que **`TempoEsperaEmHoras`** (lido de `CONFIG/azure/config.json`), define `Aguardando = true`; ao atingir o limite, marca `Insucesso = true`.
-- **Normalização de telefone** (`FormatarNumeroCelular`): remove não-dígitos, prefixa `55` quando o número não começa com `55` e tem até 11 dígitos, e adiciona `+` (resultando em formato `+55...`).
-
----
-
-## Quarentena e Retorno de Quarentena
-
-As ações `quarentena` e `retornar_quarentena` (`ExecutorQuarentena` e `ExecutorRetornarQuarentena`) fazem parte de um fluxo automatizado **cross-projeto** que envolve também o SincronizadorSAP.
-
-!!! info "Referência cruzada"
-    O detalhamento completo dessas ações — incluindo a OU mensal `5S-{MM-yyyy}`, o salvamento da OU original em `msDS-cloudExtensionAttribute1`, o timestamp no campo `info`, o intervalo mínimo de 12 horas para retorno e a regra de que o retorno **não reabilita** a conta — está na página **Ciclo de Vida da Quarentena**.
-
----
-
-## Discrepâncias
-
-Registro das divergências entre a documentação anterior e o código atual (o código é a verdade):
-
-!!! warning "Divergências corrigidas a partir do código"
-    - **8 tentativas de geração de login agora confirmadas no código.** O algoritmo era anteriormente *inferido*; foi verificado em `ExecutorInsercao.cs` (linhas 132-188 / loop em 193-233) que existem **exatamente 8 tentativas, na ordem**: `primeiro`, `primeiroI2`, `primeiroI2I3`, `primeiroI3`, `primeiroI2sobrenome`, `primeirosegundo`, `primeiroterceiro`, `primeirosegundoterceiro`.
-
-    - **Localização de `mapeamento-palavras.txt` é `CONFIG/`, não `EXEMPLOS/`.** O arquivo é carregado em produção a partir de `CONFIG/` (`ExecutorInsercao.cs:49`); referências anteriores a `EXEMPLOS/` descreviam apenas templates de exemplo, não o caminho de runtime.
-
-    - **8 desdobramentos confirmados em sequência, porém disparados condicionalmente.** A documentação anterior afirmava que a inserção *sempre* dispara os 8 desdobramentos (rede, internet, email, sap, sistemas, vpn, telefonia, azure). O código confirma que os 8 templates existem e são suportados em sequência, mas **cada desdobramento só é disparado quando o acesso correspondente é solicitado no formulário** (ex.: SAP somente se `Acesso Sistemas` > `2.1 - SAP` == `True`).
+    Ou seja, `inserir`, `azure` e `manutencao` **não** consultam listas de
+    exceção; as demais sim, distinguindo entre a lista de exceção do AD e a
+    lista de exceção específica de quarentena.
