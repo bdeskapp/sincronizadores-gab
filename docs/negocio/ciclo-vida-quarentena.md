@@ -12,46 +12,33 @@ Todo o fluxo é **dirigido por requisições** (requisição-driven): o Sincroni
 
 ## Visão geral do ciclo
 
-```text
-                          ┌──────────────────────────────────────┐
-                          │         ENTRADA EM QUARENTENA         │
-                          │            (SincronizadorAD,          │
-                          │          acao=quarentena)             │
-                          │                                       │
-                          │  1. Salva OU original (extensionAttr) │
-                          │  2. Move p/ OU mensal 5S-{MM-yyyy}    │
-                          │  3. Grava timestamp no campo info     │
-                          │  4. Desabilita a conta (UAC)          │
-                          └───────────────────┬──────────────────┘
-                                              │
-                                  conta desabilitada,
-                                 aguardando na quarentena
-                                              │
-              ┌───────────────────────────────┴───────────────────────────────┐
-              │                                                                 │
-   ┌──────────▼───────────┐                                       ┌────────────▼───────────┐
-   │  MONITORAMENTO        │                                       │  EXPIRAÇÃO              │
-   │  (SAP, 06:00          │                                       │  (SAP, 06:15            │
-   │   monitorar_quarentena│                                       │   expirar_quarentena)   │
-   │                       │                                       │                         │
-   │  lastLogon >          │                                       │  dias em quarentena ≥   │
-   │  timestampQuarentena? │                                       │  30 E sem login após    │
-   │  → abre requisição    │                                       │  → abre requisição      │
-   │     de RETORNO        │                                       │     de EXCLUSÃO         │
-   └──────────┬────────────┘                                       └────────────┬───────────┘
-              │                                                                  │
-   ┌──────────▼────────────┐                                       ┌────────────▼───────────┐
-   │  RETORNO              │                                       │  EXCLUSÃO               │
-   │  (AD, 06:30           │                                       │  (AD, 07:00             │
-   │   retornar_quarentena)│                                       │   excluir)              │
-   │                       │                                       │                         │
-   │  Lê OU original →     │                                       │  Verifica recontratação │
-   │  MoveTo(ouOriginal)   │                                       │  → envia p/ Lixeira     │
-   │  Limpa metadados      │                                       │  (conta já desabilitada)│
-   │  (conta SEGUE         │                                       │                         │
-   │   desabilitada)       │                                       │                         │
-   └───────────────────────┘                                       └─────────────────────────┘
+```mermaid
+flowchart TD
+    ENT["<b>ENTRADA EM QUARENTENA</b><br/><small>SincronizadorAD · -acao quarentena</small><br/>1. Salva OU original (extensionAttribute)<br/>2. Move p/ OU mensal 5S-{MM-yyyy}<br/>3. Grava timestamp no campo info<br/>4. Desabilita a conta (UAC)"]
+
+    ESP(["conta desabilitada,<br/>aguardando na quarentena"])
+    ENT --> ESP
+
+    MON["<b>MONITORAMENTO</b><br/><small>SAP · 06:00 · monitorar_quarentena</small><br/>lastLogon &gt; timestampQuarentena?<br/>→ abre requisição de RETORNO"]
+    EXP["<b>EXPIRAÇÃO</b><br/><small>SAP · 06:15 · expirar_quarentena</small><br/>dias em quarentena ≥ 30<br/>E sem login após<br/>→ abre requisição de EXCLUSÃO"]
+    ESP -- "houve login" --> MON
+    ESP -- "30+ dias sem login" --> EXP
+
+    RET["<b>RETORNO</b><br/><small>AD · 06:30 · retornar_quarentena</small><br/>Lê OU original → MoveTo(ouOriginal)<br/>Limpa metadados<br/><i>(conta SEGUE desabilitada)</i>"]
+    DEL["<b>EXCLUSÃO</b><br/><small>AD · 07:00 · excluir</small><br/>Verifica recontratação<br/>→ envia p/ Lixeira<br/><i>(conta já desabilitada)</i>"]
+    MON --> RET
+    EXP --> DEL
+
+    classDef ad fill:#e8eaf6,stroke:#3f51b5,color:#1a237e;
+    classDef sap fill:#e0f2f1,stroke:#00897b,color:#004d40;
+    classDef estado fill:#fff8e1,stroke:#f9a825,color:#e65100;
+    class ENT,RET,DEL ad;
+    class MON,EXP sap;
+    class ESP estado;
 ```
+
+!!! info "Cores do diagrama"
+    Azul = ações do **SincronizadorAD** · Verde = ações do **SincronizadorSAP** (sensor) · Âmbar = estado de espera.
 
 ---
 
@@ -193,16 +180,31 @@ Implementado em `src/SincronizadorAd/Executores/ExecutorRetornarQuarentena.cs`. 
 
 O `extensionAttribute` pode aparecer vazio em uma execução por replicação ainda não propagada no AD. Para não marcar insucesso prematuramente, o executor aplica um intervalo de retry — mas **apenas neste cenário específico**:
 
-```text
-Ao processar uma requisição de retorno:
-  Se extensionAttribute está PREENCHIDO
-      → move de volta à OU original e limpa metadados (fluxo normal)
-  Se extensionAttribute está VAZIO
-      → lê UltimaAcaoQuando da requisição
-        Se última ação há MENOS de 12h
-            → ignora a requisição (retentará na próxima execução)
-        Se última ação há 12h+  OU  data indisponível
-            → marca INSUCESSO
+```mermaid
+flowchart TD
+    INI(["Processar requisição<br/>de retorno"])
+    Q1{"extensionAttribute<br/>preenchido?"}
+    INI --> Q1
+
+    OK["Move de volta à OU original<br/>e limpa metadados<br/><i>(fluxo normal, sem espera)</i>"]
+    Q1 -- "Sim" --> OK
+
+    Q2{"UltimaAcaoQuando<br/>há quanto tempo?"}
+    Q1 -- "Não (vazio)" --> Q2
+
+    IGN["<b>Ignora</b> a requisição<br/><i>(retenta na próxima execução)</i>"]
+    FAIL["<b>INSUCESSO</b>"]
+    Q2 -- "&lt; 12h" --> IGN
+    Q2 -- "≥ 12h ou data indisponível" --> FAIL
+
+    classDef sucesso fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
+    classDef espera fill:#fff8e1,stroke:#f9a825,color:#e65100;
+    classDef erro fill:#ffebee,stroke:#c62828,color:#b71c1c;
+    classDef decisao fill:#e3f2fd,stroke:#1565c0,color:#0d47a1;
+    class OK sucesso;
+    class IGN espera;
+    class FAIL erro;
+    class Q1,Q2 decisao;
 ```
 
 A constante é fixa em código: `IntervaloMinimoEntreExecucoes = TimeSpan.FromHours(12)` (`ExecutorRetornarQuarentena.cs` linha 15). A lógica está nas linhas 29-47.
