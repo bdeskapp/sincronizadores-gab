@@ -1,0 +1,64 @@
+site_name: "Sincronizadores GAB — Documentacao"
+site_description: documentacao de regras de negocio e devops dos Sincronizadores GAB
+
+theme:
+  name: material
+  language: pt-BR
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Modo escuro
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Modo claro
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+  icon:
+    repo: fontawesome/brands/github
+
+nav:
+  - Inicio:
+    - Visao Geral: index.md
+  - Negocio:
+    - Regras do Sincronizador AD: negocio/sincronizador-ad.md
+    - Regras do Sincronizador SAP: negocio/sincronizador-sap.md
+    - Regras do Sincronizador Ferias: negocio/sincronizador-ferias.md
+    - Regras do Sincronizador Grupos: negocio/sincronizador-grupos.md
+    - Ciclo de Vida da Quarentena: negocio/ciclo-vida-quarentena.md
+  - DevOps:
+    - Agendamento e Operacao: devops/agendamento.md
+    - Servidores e Credenciais: devops/servidores.md
+    - Deploy e Build: devops/deploy-build.md
+    - Configuracao: devops/configuracao.md
+  - Referencia:
+    - Glossario: referencia/glossario.md
+    - Arquivos-Chave: referencia/arquivos-chave.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - attr_list
+  - md_in_html
+
+plugins:
+  - search:
+      lang: pt
