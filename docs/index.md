@@ -22,23 +22,47 @@ Cada aplicação é um executável independente, agendado pelo **Windows Task Sc
 
 O diagrama abaixo mostra como as **origens** alimentam os **sincronizadores**, que por sua vez atuam sobre os **alvos** (AD e BDesk):
 
-```text
-        ORIGENS                       SINCRONIZADORES                 ALVOS
-  ┌────────────────────┐
-  │ SAP HR (SOAP)      │──┐
-  ├────────────────────┤  │      ┌──────────────────────┐
-  │ Metadados (HTTP)   │──┼────▶ │ SincronizadorSAP     │──┐
-  ├────────────────────┤  │      │ SincronizadorFerias  │  │       ┌──────────────────┐
-  │ Metadados (SQL)    │──┘      └──────────────────────┘  ├────▶ │ Active Directory │
-  ├────────────────────┤                                    │      │ (mutações / LDAP)│
-  │ Active Directory   │────────▶ ┌──────────────────────┐  │      └──────────────────┘
-  │ (leitura ADODB)    │          │ SincronizadorGrupos  │──┘
-  └────────────────────┘          └──────────────────────┘
-                                                                   ┌──────────────────┐
-  ┌────────────────────┐          ┌──────────────────────┐        │ BDesk            │
-  │ BDesk              │────────▶ │ SincronizadorAD      │──────▶ │ (requisições /   │
-  │ (fila de requisiç.)│  fila    │ (-acao …)            │ audit. │  auditoria)      │
-  └────────────────────┘          └──────────────────────┘        └──────────────────┘
+```mermaid
+flowchart LR
+    subgraph ORIGENS["📥 Origens"]
+        direction TB
+        SAP["SAP HR<br/><small>SOAP</small>"]
+        METAH["Metadados<br/><small>HTTP</small>"]
+        METAS["Metadados<br/><small>SQL</small>"]
+        ADR["Active Directory<br/><small>leitura ADODB</small>"]
+    end
+
+    subgraph SYNC["⚙️ Sincronizadores"]
+        direction TB
+        SSAP["SincronizadorSAP"]
+        SFER["SincronizadorFerias"]
+        SGRP["SincronizadorGrupos"]
+        SAD["SincronizadorAD<br/><small>-acao …</small>"]
+    end
+
+    subgraph ALVOS["🎯 Alvos"]
+        direction TB
+        AD["Active Directory<br/><small>mutações / LDAP</small>"]
+        BD["BDesk"]
+    end
+
+    SAP --> SSAP
+    METAH --> SSAP & SFER
+    METAS --> SGRP
+    ADR --> SSAP & SFER & SGRP
+
+    SSAP & SFER & SGRP -- "abrem requisições" --> BD
+    BD == "fila de requisições" ==> SAD
+
+    SSAP & SFER & SGRP & SAD --> AD
+    SSAP & SFER & SGRP & SAD -. "auditoria" .-> BD
+
+    classDef origem fill:#e8eaf6,stroke:#3f51b5,color:#1a237e;
+    classDef sync fill:#c5cae9,stroke:#3f51b5,color:#1a237e;
+    classDef alvo fill:#fff3e0,stroke:#ef6c00,color:#e65100;
+    class SAP,METAH,METAS,ADR origem;
+    class SSAP,SFER,SGRP,SAD sync;
+    class AD,BD alvo;
 ```
 
 O **BDesk tem papel duplo** no fluxo:
